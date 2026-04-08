@@ -19,7 +19,8 @@ Implemented:
   coordinate ranges
 - flat-file blob store and append-only source index
 - typed identifier and typed error surfaces in the public library API
-- loopback integration tests for publish/index and re-announcement behavior
+- loopback integration tests for metadata-only indexing, eager fetch,
+  multi-publisher re-announcement, geo-filtered fetch, and deduplication
 
 Not yet implemented:
 
@@ -68,5 +69,7 @@ igc-net-rs/
   from arbitrary local strings
 - metadata serialization is intended to match the protocol spec literally,
   including canonical timestamps and lowercase BLAKE3 hashes
+- `IgcIrohNode::start` returns `Self`, and `publish` / `run_indexer` take
+  `&IgcIrohNode`; shared ownership is a caller concern, not forced by the API
 - Part II analytics is specified at the protocol level but not yet implemented
   here

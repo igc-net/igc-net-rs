@@ -1,0 +1,32 @@
+[package]
+name = "igc-net"
+description = "Rust library for the igc-net protocol — publish and exchange IGC flight files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/igc-net"
+readme = "../README.md"
+keywords = ["igc", "p2p", "paragliding", "i♡xc", "iroh", "gliding", "soaring"]
+categories = ["network-programming", "api-bindings"]
+
+[dependencies]
+iroh.workspace        = true
+iroh-blobs.workspace  = true
+iroh-gossip.workspace = true
+serde      = { workspace = true }
+serde_json.workspace  = true
+blake3.workspace      = true
+thiserror.workspace   = true
+tokio      = { workspace = true }
+hex.workspace         = true
+tracing.workspace     = true
+chrono     = { workspace = true }
+futures.workspace     = true
+rand.workspace        = true
+
+[dev-dependencies]
+tempfile             = { workspace = true }
+tracing-subscriber   = { workspace = true }

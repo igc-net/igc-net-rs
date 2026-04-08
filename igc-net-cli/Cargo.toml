@@ -1,0 +1,29 @@
+[package]
+name = "igc-net-cli"
+description = "Standalone archival node CLI for the igc-net protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/igc-net-cli"
+readme = "../README.md"
+keywords = ["igc", "p2p", "iroh", "i♡xc", "cli", "paragliding", "gliding"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "igc-net"
+path = "src/main.rs"
+
+[dependencies]
+igc-net            = { path = "../igc-net" }
+iroh               = { workspace = true }
+tokio              = { workspace = true }
+clap               = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex                = { workspace = true }
+blake3             = { workspace = true }
+serde_json         = { workspace = true }
