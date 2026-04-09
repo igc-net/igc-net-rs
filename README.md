@@ -21,12 +21,11 @@ Implemented:
 - typed identifier and typed error surfaces in the public library API
 - loopback integration tests for metadata-only indexing, eager fetch,
   multi-publisher re-announcement, geo-filtered fetch, and deduplication
+- crates.io publication for both `igc-net` and `igc-net-cli`
 
 Not yet implemented:
 
 - Part II analytics / `IGC_META_DOC`
-- crates.io publication
-- final GitHub repository rename to `igc-net-rs`
 
 ## Repository Boundary
 
@@ -62,6 +61,27 @@ igc-net-rs/
 - [docs/getting-started.md](docs/getting-started.md) — Rust consumer quickstart
 - [docs/metadata-schema.md](docs/metadata-schema.md) — Rust mapping of the
   canonical metadata schema
+- crates.io package pages:
+  - [`igc-net`](https://crates.io/crates/igc-net)
+  - [`igc-net-cli`](https://crates.io/crates/igc-net-cli)
+- API documentation:
+  - [`docs.rs/igc-net`](https://docs.rs/igc-net)
+  - [`docs.rs/igc-net-cli`](https://docs.rs/igc-net-cli)
+
+## Installation
+
+Install the Rust CLI:
+
+```bash
+cargo install igc-net-cli
+```
+
+Add the library to your Rust project:
+
+```toml
+[dependencies]
+igc-net = "0.1"
+```
 
 ## Notes
 
