@@ -1,6 +1,6 @@
 [package]
 name = "igc-net"
-description = "Rust library for the igc-net protocol — publish and exchange IGC flight files"
+description = "igc-net protocol rust library — publish and add metadata to IGC flight files"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/igc-net"
 readme = "../README.md"
-keywords = ["igc", "p2p", "paragliding", "i♡xc", "iroh", "gliding", "soaring"]
+keywords = ["igc", "p2p", "paragliding", "iroh", "soaring"]
 categories = ["network-programming", "api-bindings"]
 
 [dependencies]
