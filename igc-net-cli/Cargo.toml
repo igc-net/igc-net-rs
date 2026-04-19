@@ -17,7 +17,7 @@ name = "igc-net"
 path = "src/main.rs"
 
 [dependencies]
-igc-net            = { version = "=0.1.0", path = "../igc-net" }
+igc-net            = { version = "=0.3.0", path = "../igc-net" }
 iroh               = { workspace = true }
 tokio              = { workspace = true }
 clap               = { workspace = true }
@@ -27,3 +27,8 @@ tracing-subscriber = { workspace = true }
 hex                = { workspace = true }
 blake3             = { workspace = true }
 serde_json         = { workspace = true }
+chrono             = { workspace = true }
+rand               = { workspace = true }
+
+[dev-dependencies]
+tempfile           = { workspace = true }

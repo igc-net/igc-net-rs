@@ -1,4 +1,4 @@
-.PHONY: help build test itest vet docs clean
+.PHONY: help build test itest identity-regression vet docs clean
 
 help: ## List all available targets with descriptions
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-8s %s\n", $$1, $$2}'
@@ -17,6 +17,11 @@ itest: ## Run workspace integration test targets only (files under */tests; igno
 		echo "==> cargo test -p $$crate --test $$test_name"; \
 		cargo test -p "$$crate" --test "$$test_name"; \
 	done
+
+identity-regression: ## Run first-release identity regression targets
+	cargo test -p igc-net --lib
+	cargo test -p igc-net --lib --no-default-features
+	cargo test -p igc-net-cli
 
 vet: ## Run clippy (warnings as errors) and check formatting across all crates
 	cargo clippy --workspace --all-targets -- -D warnings

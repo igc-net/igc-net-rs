@@ -74,3 +74,28 @@ pub async fn wait_for_index_count(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Poll governance state until `pilot_id` resolves authoritatively to
+/// `expected_record_id`, or `timeout` elapses. Returns `true` if matched.
+pub async fn wait_for_pilot_auth_record(
+    node: &igc_net::IgcIrohNode,
+    pilot_id: &igc_net::PilotId,
+    expected_record_id: &igc_net::Blake3Hex,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let matched = node
+            .resolve_pilot_auth_did_state(pilot_id)
+            .ok()
+            .and_then(|state| state.authoritative)
+            .is_some_and(|record| record.record_id == *expected_record_id);
+        if matched {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

@@ -11,16 +11,29 @@ use futures::StreamExt;
 use iroh::Endpoint;
 use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::presets;
-use iroh::protocol::Router;
+use iroh::endpoint::{Connection, presets};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh_blobs::store::fs::FsStore;
-use iroh_gossip::api::GossipSender;
+use iroh_gossip::api::{Event as GossipEvent, GossipSender};
 use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 use iroh_gossip::proto::TopicId;
 
+use crate::governance::{
+    GovernanceStore, GovernanceStoreError, PilotAuthDidGossipAnnouncement, PilotAuthDidState,
+    PilotAuthDidSyncRequest, PilotAuthDidSyncResponse, PilotAuthDidWorkflowError,
+    issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
+};
 use crate::id::NodeIdHex;
+use crate::id::PilotId;
+use crate::keys::{
+    PilotIdentity, PilotKeyStore, PilotKeyStoreError, PilotKeyStoreStatus, PilotPublicIdentity,
+};
 use crate::store::{FlatFileStore, StoreError};
-use crate::topic::announce_topic_id;
+use crate::topic::{announce_topic_id, pilot_auth_did_governance_topic_id};
+
+const GOVERNANCE_SYNC_ALPN: &[u8] = b"igc-net/governance-sync/v1";
+const GOVERNANCE_SYNC_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const GOVERNANCE_SYNC_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -28,6 +41,23 @@ use crate::topic::announce_topic_id;
 pub enum NodeError {
     #[error("store: {0}")]
     Store(#[from] StoreError),
+    #[error("pilot keys: {0}")]
+    PilotKeys(#[from] PilotKeyStoreError),
+    #[error("governance: {0}")]
+    Governance(#[from] GovernanceStoreError),
+    #[error("pilot-auth-did workflow: {0}")]
+    PilotAuthDidWorkflow(#[from] PilotAuthDidWorkflowError),
+    #[error("pilot-auth-did sync: {0}")]
+    PilotAuthDidSync(#[from] crate::governance::PilotAuthDidSyncError),
+    #[error("pilot-auth-did rotation governance persist failed after key replacement: {0}")]
+    PilotAuthDidRotationPersistFailed(GovernanceStoreError),
+    #[error(
+        "pilot-auth-did rotation governance persist failed after key replacement ({persist}); rollback also failed ({rollback})"
+    )]
+    PilotAuthDidRotationPersistRollback {
+        persist: GovernanceStoreError,
+        rollback: PilotKeyStoreError,
+    },
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to bind iroh endpoint: {0}")]
@@ -36,6 +66,16 @@ pub enum NodeError {
     BlobStoreLoad(String),
     #[error("failed to subscribe to announce topic: {0}")]
     GossipSubscribe(String),
+    #[error("failed to subscribe to pilot-auth-did governance topic: {0}")]
+    GovernanceGossipSubscribe(String),
+    #[error("failed to join pilot-auth-did governance topic peers: {0}")]
+    GovernanceGossipJoin(String),
+    #[error("failed to broadcast pilot-auth-did governance update: {0}")]
+    GovernanceGossipBroadcast(String),
+    #[error("pilot-auth-did network sync transport failed: {0}")]
+    GovernanceSyncTransport(String),
+    #[error("pilot-auth-did network sync JSON: {0}")]
+    GovernanceSyncJson(#[from] serde_json::Error),
     #[error("no IPv4 loopback socket is bound for this node")]
     NoLoopbackSocket,
 }
@@ -67,13 +107,124 @@ pub struct IgcIrohNode {
     /// Also used by `publish()` to broadcast announcements without creating a
     /// new subscription per call.
     announce_sender: GossipSender,
+    /// Persistent pilot-auth-did governance topic sender.
+    ///
+    /// Local issuance/rotation broadcasts lightweight governance update
+    /// announcements on this topic. Receivers then use the pull-sync transport
+    /// to fetch any missing records from the delivering peer.
+    governance_sender: GossipSender,
     node_id: NodeIdHex,
+    node_key_bytes: [u8; 32],
+    pilot_keys: PilotKeyStore,
+    governance: GovernanceStore,
+}
+
+#[derive(Debug, Clone)]
+struct GovernanceSyncProtocol {
+    governance: GovernanceStore,
+}
+
+impl ProtocolHandler for GovernanceSyncProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        let request_bytes = recv
+            .read_to_end(GOVERNANCE_SYNC_MAX_REQUEST_BYTES)
+            .await
+            .map_err(AcceptError::from_err)?;
+        let request: PilotAuthDidSyncRequest =
+            serde_json::from_slice(&request_bytes).map_err(AcceptError::from_err)?;
+        let response = self
+            .governance
+            .prepare_pilot_auth_did_sync(&request)
+            .map_err(AcceptError::from_err)?;
+        let response_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&response_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+async fn request_pilot_auth_did_sync_from_peer_via(
+    endpoint: &Endpoint,
+    peer: iroh::PublicKey,
+    request: &PilotAuthDidSyncRequest,
+) -> Result<PilotAuthDidSyncResponse, NodeError> {
+    let conn = endpoint
+        .connect(peer, GOVERNANCE_SYNC_ALPN)
+        .await
+        .map_err(|err| NodeError::GovernanceSyncTransport(err.to_string()))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|err| NodeError::GovernanceSyncTransport(err.to_string()))?;
+    let request_bytes = serde_json::to_vec(request)?;
+    send.write_all(&request_bytes)
+        .await
+        .map_err(|err| NodeError::GovernanceSyncTransport(err.to_string()))?;
+    send.finish()
+        .map_err(|err| NodeError::GovernanceSyncTransport(err.to_string()))?;
+    let response_bytes = recv
+        .read_to_end(GOVERNANCE_SYNC_MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|err| NodeError::GovernanceSyncTransport(err.to_string()))?;
+    let response: PilotAuthDidSyncResponse = serde_json::from_slice(&response_bytes)?;
+    response.validate()?;
+    conn.close(0u32.into(), b"pilot-auth-did-sync-complete");
+    Ok(response)
+}
+
+async fn broadcast_pilot_auth_did_gossip_announcement(
+    sender: &GossipSender,
+    announcement: &PilotAuthDidGossipAnnouncement,
+) -> Result<(), NodeError> {
+    let payload = serde_json::to_vec(announcement)?;
+    sender
+        .broadcast(payload.into())
+        .await
+        .map_err(|err| NodeError::GovernanceGossipBroadcast(err.to_string()))
+}
+
+async fn sync_pilot_auth_did_from_gossip_announcement(
+    endpoint: &Endpoint,
+    governance: &GovernanceStore,
+    governance_sender: &GossipSender,
+    delivered_from: iroh::PublicKey,
+    announcement: &PilotAuthDidGossipAnnouncement,
+) -> Result<usize, NodeError> {
+    let request = governance.build_pilot_auth_did_sync_request(&announcement.pilot_id)?;
+    if request.knows(&announcement.record_id) {
+        return Ok(0);
+    }
+
+    let response =
+        request_pilot_auth_did_sync_from_peer_via(endpoint, delivered_from, &request).await?;
+    let applied = governance.apply_pilot_auth_did_sync(&response)?;
+
+    if applied == 0 {
+        return Ok(0);
+    }
+
+    for record in response
+        .records
+        .iter()
+        .filter(|record| !request.knows(&record.record_id))
+    {
+        let announcement = PilotAuthDidGossipAnnouncement::from_record(record);
+        broadcast_pilot_auth_did_gossip_announcement(governance_sender, &announcement).await?;
+    }
+
+    Ok(applied)
 }
 
 impl IgcIrohNode {
     /// Build and start a node rooted at `data_dir`.
     ///
     /// - Loads or generates the Ed25519 key from `data_dir/node.key`.
+    /// - Initializes the separate `pilot-keys/` directory for pilot identity
+    ///   custody; pilot keys remain distinct from the node transport key.
     /// - Opens `FlatFileStore` at `data_dir`.
     /// - Binds an iroh `Endpoint`, starts `iroh-blobs` and `iroh-gossip`.
     /// - Subscribes to the announce gossip topic so remote peers can join
@@ -97,6 +248,10 @@ impl IgcIrohNode {
             }
         };
         let secret_key = iroh::SecretKey::from_bytes(&key_bytes);
+        let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
+        pilot_keys.init()?;
+        let governance = GovernanceStore::for_data_dir(&data_dir);
+        governance.init()?;
 
         // ── iroh Endpoint ─────────────────────────────────────────────────────
         // `MemoryLookup` allows callers to pre-populate peer addresses before
@@ -126,12 +281,16 @@ impl IgcIrohNode {
         // `Router` is `#[must_use]` — the accept loop runs as long as the
         // handle is alive.  It is stored in `IgcIrohNode` so it lives for the
         // full lifetime of the node.
+        let governance_sync = GovernanceSyncProtocol {
+            governance: governance.clone(),
+        };
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(
                 iroh_blobs::ALPN,
                 iroh_blobs::BlobsProtocol::new(&fs_store, None),
             )
+            .accept(GOVERNANCE_SYNC_ALPN, governance_sync)
             .spawn();
 
         // ── Persistent announce-topic subscription ────────────────────────────
@@ -153,6 +312,84 @@ impl IgcIrohNode {
         // filling the event buffer and closing the subscription.
         tokio::spawn(async move { while announce_receiver.next().await.is_some() {} });
 
+        // ── Persistent pilot-auth-did governance subscription ─────────────────
+        let governance_topic = TopicId::from_bytes(pilot_auth_did_governance_topic_id());
+        let (governance_sender, mut governance_receiver) = gossip
+            .subscribe(governance_topic, vec![])
+            .await
+            .map_err(|e| NodeError::GovernanceGossipSubscribe(e.to_string()))?
+            .split();
+        let governance_sender_task = governance_sender.clone();
+        let governance_store = governance.clone();
+        let governance_endpoint = endpoint.clone();
+        let local_endpoint_id = endpoint.id();
+        tokio::spawn(async move {
+            while let Some(event) = governance_receiver.next().await {
+                match event {
+                    Ok(GossipEvent::Received(message)) => {
+                        if message.delivered_from == local_endpoint_id {
+                            continue;
+                        }
+                        let announcement: PilotAuthDidGossipAnnouncement =
+                            match serde_json::from_slice(&message.content) {
+                                Ok(announcement) => announcement,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        peer = %message.delivered_from,
+                                        error = %err,
+                                        "ignoring invalid pilot-auth-did governance gossip payload"
+                                    );
+                                    continue;
+                                }
+                            };
+                        match sync_pilot_auth_did_from_gossip_announcement(
+                            &governance_endpoint,
+                            &governance_store,
+                            &governance_sender_task,
+                            message.delivered_from,
+                            &announcement,
+                        )
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(applied) => tracing::info!(
+                                peer = %message.delivered_from,
+                                pilot_id = %announcement.pilot_id,
+                                record_id = %announcement.record_id,
+                                applied,
+                                "applied pilot-auth-did governance update from gossip"
+                            ),
+                            Err(err) => tracing::warn!(
+                                peer = %message.delivered_from,
+                                pilot_id = %announcement.pilot_id,
+                                record_id = %announcement.record_id,
+                                error = %err,
+                                "failed to apply pilot-auth-did governance update from gossip"
+                            ),
+                        }
+                    }
+                    Ok(GossipEvent::NeighborUp(peer)) => {
+                        tracing::debug!(%peer, "pilot-auth-did governance neighbor up");
+                    }
+                    Ok(GossipEvent::NeighborDown(peer)) => {
+                        tracing::debug!(%peer, "pilot-auth-did governance neighbor down");
+                    }
+                    Ok(GossipEvent::Lagged) => {
+                        tracing::warn!(
+                            "pilot-auth-did governance gossip receiver lagged; some updates may require catch-up"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "pilot-auth-did governance gossip subscription closed"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
         tracing::info!(%node_id, data_dir = %data_dir.display(), "igc-net node started");
 
         Ok(Self {
@@ -163,7 +400,11 @@ impl IgcIrohNode {
             memory_lookup,
             _router: router,
             announce_sender,
+            governance_sender,
             node_id,
+            node_key_bytes: key_bytes,
+            pilot_keys,
+            governance,
         })
     }
 
@@ -201,10 +442,7 @@ impl IgcIrohNode {
     pub fn loopback_endpoint_addr(&self) -> Result<EndpointAddr, NodeError> {
         let id = self.endpoint.id();
         let port = self.loopback_port()?;
-        Ok(EndpointAddr::new(id).with_ip_addr(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))))
+        Ok(EndpointAddr::new(id).with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port))))
     }
 
     /// Return the node's loopback endpoint as a `"node_id@127.0.0.1:port"` string.
@@ -226,6 +464,28 @@ impl IgcIrohNode {
         self.memory_lookup.add_endpoint_info(addr);
     }
 
+    /// Join known peers on the pilot-auth-did governance gossip topic.
+    ///
+    /// Call this after populating peer addresses for direct/private networks.
+    /// Receiving a governance gossip announcement triggers a pull-sync against
+    /// the delivering peer over the dedicated governance-sync transport.
+    pub async fn join_pilot_auth_did_gossip_peers(
+        &self,
+        peers: Vec<iroh::PublicKey>,
+    ) -> Result<(), NodeError> {
+        let peers = peers
+            .into_iter()
+            .filter(|peer| *peer != self.iroh_node_id())
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return Ok(());
+        }
+        self.governance_sender
+            .join_peers(peers)
+            .await
+            .map_err(|err| NodeError::GovernanceGossipJoin(err.to_string()))
+    }
+
     /// The persistent announce-topic sender.
     ///
     /// Use this to broadcast on the announce topic without creating a new
@@ -234,9 +494,151 @@ impl IgcIrohNode {
         &self.announce_sender
     }
 
+    async fn broadcast_pilot_auth_did_update(
+        &self,
+        record: &crate::PilotAuthDidRecord,
+    ) -> Result<(), NodeError> {
+        let announcement = PilotAuthDidGossipAnnouncement::from_record(record);
+        broadcast_pilot_auth_did_gossip_announcement(&self.governance_sender, &announcement).await
+    }
+
     /// Access the local flat-file store.
     pub fn store(&self) -> &FlatFileStore {
         self.store.as_ref()
+    }
+
+    /// Inspect the dedicated pilot key store layout and current file presence.
+    pub fn inspect_pilot_key_store(&self) -> Result<PilotKeyStoreStatus, NodeError> {
+        Ok(self.pilot_keys.inspect()?)
+    }
+
+    /// Load existing pilot identity material from the encrypted pilot key store.
+    pub fn load_pilot_identity(&self) -> Result<Option<PilotIdentity>, NodeError> {
+        Ok(self.pilot_keys.load(&self.node_secret_key())?)
+    }
+
+    /// Load existing pilot identity material or generate a fresh initial pair.
+    pub fn load_or_generate_pilot_identity(&self) -> Result<PilotIdentity, NodeError> {
+        Ok(self.pilot_keys.load_or_generate(&self.node_secret_key())?)
+    }
+
+    /// Export only the public pilot identity material in stable machine-readable form.
+    pub fn export_pilot_public_identity(&self) -> Result<Option<PilotPublicIdentity>, NodeError> {
+        Ok(self
+            .pilot_keys
+            .export_public_identity(&self.node_secret_key())?)
+    }
+
+    /// Access the governance store that persists identity governance records.
+    pub fn governance_store(&self) -> &GovernanceStore {
+        &self.governance
+    }
+
+    /// Resolve the current pilot-auth-DID state using local governance history.
+    pub fn resolve_pilot_auth_did_state(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<PilotAuthDidState, NodeError> {
+        Ok(self.governance.resolve_pilot_auth_did_state(pilot_id)?)
+    }
+
+    /// Build a pull-style catch-up response for a peer's known pilot-auth-DID history.
+    pub fn prepare_pilot_auth_did_sync(
+        &self,
+        request: &PilotAuthDidSyncRequest,
+    ) -> Result<PilotAuthDidSyncResponse, NodeError> {
+        Ok(self.governance.prepare_pilot_auth_did_sync(request)?)
+    }
+
+    /// Build a pull-style catch-up request from the node's full local pilot-auth-DID history.
+    pub fn build_pilot_auth_did_sync_request(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<PilotAuthDidSyncRequest, NodeError> {
+        Ok(self
+            .governance
+            .build_pilot_auth_did_sync_request(pilot_id)?)
+    }
+
+    /// Apply a pulled batch of pilot-auth-DID governance records to local storage.
+    pub fn apply_pilot_auth_did_sync(
+        &self,
+        response: &PilotAuthDidSyncResponse,
+    ) -> Result<usize, NodeError> {
+        Ok(self.governance.apply_pilot_auth_did_sync(response)?)
+    }
+
+    /// Request a peer's catch-up response over the governance-sync transport.
+    pub async fn request_pilot_auth_did_sync_from_peer(
+        &self,
+        peer: iroh::PublicKey,
+        request: &PilotAuthDidSyncRequest,
+    ) -> Result<PilotAuthDidSyncResponse, NodeError> {
+        request_pilot_auth_did_sync_from_peer_via(&self.endpoint, peer, request).await
+    }
+
+    /// Pull pilot-auth-DID governance records for `pilot_id` from a peer and apply them locally.
+    pub async fn sync_pilot_auth_did_from_peer(
+        &self,
+        peer: iroh::PublicKey,
+        pilot_id: &PilotId,
+    ) -> Result<usize, NodeError> {
+        let request = self.build_pilot_auth_did_sync_request(pilot_id)?;
+        let response = self
+            .request_pilot_auth_did_sync_from_peer(peer, &request)
+            .await?;
+        self.apply_pilot_auth_did_sync(&response)
+    }
+
+    /// Create and persist the initial pilot-auth-did-record for this node's pilot identity.
+    pub async fn issue_initial_pilot_auth_did_record(
+        &self,
+        created_at: impl Into<String>,
+    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
+        let identity = self.load_or_generate_pilot_identity()?;
+        let record = issue_initial_pilot_auth_did_record(&self.governance, &identity, created_at)?;
+        self.governance.persist_pilot_auth_did_record(&record)?;
+        self.broadcast_pilot_auth_did_update(&record).await?;
+        Ok(record)
+    }
+
+    /// Rotate the active pilot_auth_did key, archive the previous key, and persist the new governance record.
+    pub async fn rotate_pilot_auth_did(
+        &self,
+        created_at: impl Into<String>,
+    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
+        let current_identity = self
+            .load_pilot_identity()?
+            .ok_or(PilotKeyStoreError::MissingPilotIdentity)?;
+        let next_active_pilot_auth_secret_key = self
+            .pilot_keys
+            .generate_next_active_pilot_auth_secret_key(&self.node_secret_key())?;
+        let record = rotate_pilot_auth_did_record(
+            &self.governance,
+            &current_identity,
+            &next_active_pilot_auth_secret_key,
+            created_at,
+        )?;
+        self.pilot_keys.replace_active_pilot_auth(
+            &self.node_secret_key(),
+            &next_active_pilot_auth_secret_key,
+        )?;
+        if let Err(persist_err) = self.governance.persist_pilot_auth_did_record(&record) {
+            match self.pilot_keys.replace_active_pilot_auth(
+                &self.node_secret_key(),
+                &current_identity.active_pilot_auth_secret_key(),
+            ) {
+                Ok(_) => return Err(NodeError::PilotAuthDidRotationPersistFailed(persist_err)),
+                Err(rollback_err) => {
+                    return Err(NodeError::PilotAuthDidRotationPersistRollback {
+                        persist: persist_err,
+                        rollback: rollback_err,
+                    });
+                }
+            }
+        }
+        self.broadcast_pilot_auth_did_update(&record).await?;
+        Ok(record)
     }
 
     /// Resolve a local read-only filesystem path for a BLAKE3-keyed blob.
@@ -252,7 +654,17 @@ impl IgcIrohNode {
         self.endpoint
             .bound_sockets()
             .into_iter()
-            .find_map(|addr| if addr.is_ipv4() { Some(addr.port()) } else { None })
+            .find_map(|addr| {
+                if addr.is_ipv4() {
+                    Some(addr.port())
+                } else {
+                    None
+                }
+            })
             .ok_or(NodeError::NoLoopbackSocket)
+    }
+
+    fn node_secret_key(&self) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&self.node_key_bytes)
     }
 }

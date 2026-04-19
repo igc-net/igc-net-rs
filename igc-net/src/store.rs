@@ -119,8 +119,14 @@ impl FlatFileStore {
 
     /// Rebuild the in-memory caches from `index.ndjson`.
     fn reload_cache(&self) -> Result<(), StoreError> {
-        let mut dedup = self.dedup_cache.write().map_err(|_| StoreError::PoisonedLock("dedup_cache"))?;
-        let mut metas = self.meta_hash_cache.write().map_err(|_| StoreError::PoisonedLock("meta_hash_cache"))?;
+        let mut dedup = self
+            .dedup_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("dedup_cache"))?;
+        let mut metas = self
+            .meta_hash_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("meta_hash_cache"))?;
         let mut latest_local = self
             .latest_local_publish_cache
             .write()
@@ -289,7 +295,9 @@ impl FlatFileStore {
     ) -> Result<impl Iterator<Item = Result<IndexRecord, StoreError>>, StoreError> {
         let records = self.index_records_read()?.clone();
         Ok(Box::new(records.into_iter().map(Ok))
-            as Box<dyn Iterator<Item = Result<IndexRecord, StoreError>>>)
+            as Box<
+                dyn Iterator<Item = Result<IndexRecord, StoreError>>,
+            >)
     }
 
     /// Iterate all records in `index.ndjson` (synchronous, for startup only).

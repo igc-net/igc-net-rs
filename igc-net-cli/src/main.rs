@@ -2,13 +2,18 @@
 //!
 //! All subcommands accept `--data-dir` (default: `$HOME/.igc-net`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use igc_net::{
-    Blake3Hex, FetchPolicy, FlatFileStore, FlightMetadata, IgcIrohNode, IndexerConfig,
-    announce_topic_id, publish, run_indexer,
+    Blake3Hex, DidKey, FetchPolicy, FlatFileStore, FlightMetadata, GovernanceStore, IgcIrohNode,
+    IndexerConfig, PilotAuthDidRecord, PilotAuthDidStateStatus, PilotKeyStore,
+    PilotProfileCredentialRequest, PilotProfileCredentialSubjectDraft,
+    PilotProfileCredentialVerification, PilotProfileCredentialVerifier, SystemClock,
+    announce_topic_id, issue_initial_pilot_auth_did_record, issue_pilot_profile_credential,
+    publish, rotate_pilot_auth_did_record, run_indexer,
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -85,6 +90,86 @@ enum Command {
 
     /// List all flights in the local index.
     List,
+
+    /// Inspect pilot identity and pilot-auth-did governance state offline.
+    #[command(name = "pilot-auth-status")]
+    PilotAuthStatus,
+
+    /// Inspect and validate a `did:key` value offline.
+    #[command(name = "did-key-inspect")]
+    DidKeyInspect {
+        /// The `did:key` value to inspect.
+        did: String,
+    },
+
+    /// Create and persist the initial pilot-auth-did-record offline.
+    #[command(name = "pilot-auth-issue-initial")]
+    PilotAuthIssueInitial {
+        /// Override created_at. Defaults to current UTC time truncated to seconds.
+        #[arg(long)]
+        created_at: Option<String>,
+    },
+
+    /// Rotate the active pilot_auth_did key and persist the new governance record offline.
+    #[command(name = "pilot-auth-rotate")]
+    PilotAuthRotate {
+        /// Override created_at. Defaults to current UTC time truncated to seconds.
+        #[arg(long)]
+        created_at: Option<String>,
+    },
+
+    /// Parse and print a pilot-auth-did record JSON file offline.
+    #[command(name = "pilot-auth-record-inspect")]
+    PilotAuthRecordInspect {
+        /// Path to a JSON file containing a pilot-auth-did record.
+        file: PathBuf,
+    },
+
+    /// Validate a pilot-auth-did record JSON file offline.
+    #[command(name = "pilot-auth-record-verify")]
+    PilotAuthRecordVerify {
+        /// Path to a JSON file containing a pilot-auth-did record.
+        file: PathBuf,
+    },
+
+    /// Issue a PilotProfileCredential VC-JWT offline using local authoritative state.
+    #[command(name = "pilot-profile-issue")]
+    PilotProfileIssue {
+        /// Credential JWT ID.
+        #[arg(long)]
+        jti: String,
+
+        /// Optional display name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Optional ISO 3166-1 alpha-2 country code.
+        #[arg(long)]
+        country: Option<String>,
+
+        /// Optional audience claim.
+        #[arg(long)]
+        audience: Option<String>,
+
+        /// Optional expiration window in seconds.
+        #[arg(long)]
+        expires_in_seconds: Option<u64>,
+
+        /// Optional output path for the compact JWT.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Verify a PilotProfileCredential VC-JWT offline against local governance state.
+    #[command(name = "pilot-profile-verify")]
+    PilotProfileVerify {
+        /// Path to a file containing a compact JWT, or the compact JWT itself.
+        input: String,
+
+        /// Optional audience expected to be present in the `aud` claim.
+        #[arg(long)]
+        expected_audience: Option<String>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -104,12 +189,44 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Announce { file, linger } => cmd_announce(data_dir, file, linger).await,
-        Command::RunIndex { policy, bootstrap, peer_addr } => {
-            cmd_runindex(data_dir, policy, bootstrap, peer_addr).await
-        }
+        Command::RunIndex {
+            policy,
+            bootstrap,
+            peer_addr,
+        } => cmd_runindex(data_dir, policy, bootstrap, peer_addr).await,
         Command::Fetch { igc_hash, out } => cmd_fetch(data_dir, igc_hash, out).await,
         Command::Inspect { file } => cmd_inspect(file),
         Command::List => cmd_list(data_dir),
+        Command::PilotAuthStatus => cmd_pilot_auth_status(data_dir),
+        Command::DidKeyInspect { did } => cmd_did_key_inspect(did),
+        Command::PilotAuthIssueInitial { created_at } => {
+            cmd_pilot_auth_issue_initial(data_dir, created_at)
+        }
+        Command::PilotAuthRotate { created_at } => cmd_pilot_auth_rotate(data_dir, created_at),
+        Command::PilotAuthRecordInspect { file } => cmd_pilot_auth_record_inspect(file),
+        Command::PilotAuthRecordVerify { file } => cmd_pilot_auth_record_verify(file),
+        Command::PilotProfileIssue {
+            jti,
+            name,
+            country,
+            audience,
+            expires_in_seconds,
+            out,
+        } => cmd_pilot_profile_issue(
+            data_dir,
+            PilotProfileIssueOptions {
+                jti,
+                name,
+                country,
+                audience,
+                expires_in_seconds,
+                out,
+            },
+        ),
+        Command::PilotProfileVerify {
+            input,
+            expected_audience,
+        } => cmd_pilot_profile_verify(data_dir, input, expected_audience),
     }
 }
 
@@ -253,6 +370,281 @@ fn cmd_list(data_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PilotProfileIssueOptions {
+    jti: String,
+    name: Option<String>,
+    country: Option<String>,
+    audience: Option<String>,
+    expires_in_seconds: Option<u64>,
+    out: Option<PathBuf>,
+}
+
+fn cmd_did_key_inspect(did: String) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&did_key_inspect_json(&did)?)?
+    );
+    Ok(())
+}
+
+fn cmd_pilot_auth_status(data_dir: PathBuf) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&pilot_auth_status_json(&data_dir)?)?
+    );
+    Ok(())
+}
+
+fn pilot_auth_status_json(data_dir: &std::path::Path) -> Result<serde_json::Value> {
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
+    pilot_keys.init()?;
+    let governance = GovernanceStore::for_data_dir(&data_dir);
+    governance.init()?;
+
+    let key_status = pilot_keys.inspect()?;
+    let archived_pilot_auth_dids = pilot_keys.archived_pilot_auth_dids()?;
+    let public_identity = pilot_keys.export_public_identity(&node_secret_key)?;
+    let governance_state = match &public_identity {
+        Some(identity) => Some(governance.resolve_pilot_auth_did_state(&identity.pilot_id)?),
+        None => None,
+    };
+
+    Ok(serde_json::json!({
+        "key_store": key_status,
+        "archived_pilot_auth_dids": archived_pilot_auth_dids,
+        "public_identity": public_identity,
+        "governance_state": governance_state.as_ref().map(|state| serde_json::json!({
+            "status": pilot_auth_state_status_label(state.status()),
+            "authoritative": state.authoritative,
+            "tentative_record_ids": state.tentative_record_ids,
+        })),
+    }))
+}
+
+fn cmd_pilot_auth_issue_initial(data_dir: PathBuf, created_at: Option<String>) -> Result<()> {
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
+    pilot_keys.init()?;
+    let governance = GovernanceStore::for_data_dir(&data_dir);
+    governance.init()?;
+
+    let identity = pilot_keys.load_or_generate(&node_secret_key)?;
+    let record = issue_initial_pilot_auth_did_record(
+        &governance,
+        &identity,
+        created_at.unwrap_or_else(canonical_utc_now),
+    )?;
+    governance.persist_pilot_auth_did_record(&record)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+fn cmd_pilot_auth_record_inspect(file: PathBuf) -> Result<()> {
+    let record = load_pilot_auth_record(&file)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+fn cmd_pilot_auth_record_verify(file: PathBuf) -> Result<()> {
+    let record = load_pilot_auth_record(&file)?;
+    record.validate()?;
+    let output = serde_json::json!({
+        "status": "valid",
+        "record": record,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn cmd_pilot_profile_issue(data_dir: PathBuf, options: PilotProfileIssueOptions) -> Result<()> {
+    let issued = issue_pilot_profile_jwt(&data_dir, &options, &SystemClock)?;
+    if let Some(path) = &options.out {
+        std::fs::write(path, issued.compact_jwt.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    println!("{}", serde_json::to_string_pretty(&issued.json_output())?);
+    Ok(())
+}
+
+fn cmd_pilot_profile_verify(
+    data_dir: PathBuf,
+    input: String,
+    expected_audience: Option<String>,
+) -> Result<()> {
+    let governance = GovernanceStore::for_data_dir(&data_dir);
+    governance.init()?;
+    let compact = load_text_input(&input)?;
+    let mut verifier = PilotProfileCredentialVerifier::new(&governance, &SystemClock);
+    if let Some(expected) = expected_audience.as_deref() {
+        verifier = verifier.with_expected_audience(expected);
+    }
+    let verification = verifier.verify(compact.trim());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&pilot_profile_verification_json(verification))?
+    );
+    Ok(())
+}
+
+fn cmd_pilot_auth_rotate(data_dir: PathBuf, created_at: Option<String>) -> Result<()> {
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
+    pilot_keys.init()?;
+    let governance = GovernanceStore::for_data_dir(&data_dir);
+    governance.init()?;
+
+    let current_identity = pilot_keys
+        .load(&node_secret_key)?
+        .context("pilot identity is not initialized; issue the initial record first")?;
+    let next_active_pilot_auth_secret_key =
+        pilot_keys.generate_next_active_pilot_auth_secret_key(&node_secret_key)?;
+    let record = rotate_pilot_auth_did_record(
+        &governance,
+        &current_identity,
+        &next_active_pilot_auth_secret_key,
+        created_at.unwrap_or_else(canonical_utc_now),
+    )?;
+    pilot_keys.replace_active_pilot_auth(&node_secret_key, &next_active_pilot_auth_secret_key)?;
+    if let Err(persist_err) = governance.persist_pilot_auth_did_record(&record) {
+        match pilot_keys.replace_active_pilot_auth(
+            &node_secret_key,
+            &current_identity.active_pilot_auth_secret_key(),
+        ) {
+            Ok(_) => return Err(persist_err.into()),
+            Err(rollback_err) => {
+                anyhow::bail!(
+                    "rotation governance persist failed after key replacement ({persist_err}); rollback also failed ({rollback_err})"
+                );
+            }
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssuedPilotProfileCredential {
+    compact_jwt: String,
+    header: serde_json::Value,
+    claims: serde_json::Value,
+    written_to: Option<PathBuf>,
+}
+
+impl IssuedPilotProfileCredential {
+    fn json_output(&self) -> serde_json::Value {
+        serde_json::json!({
+            "compact_jwt": self.compact_jwt,
+            "header": self.header,
+            "claims": self.claims,
+            "written_to": self.written_to.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+}
+
+fn did_key_inspect_json(did: &str) -> Result<serde_json::Value> {
+    let did = DidKey::parse(did)?;
+    Ok(serde_json::json!({
+        "did": did,
+        "method_specific_id": did.method_specific_id(),
+        "kid": did.key_id(),
+        "public_key_hex": did.public_key().to_string(),
+    }))
+}
+
+fn load_pilot_auth_record(file: &std::path::Path) -> Result<PilotAuthDidRecord> {
+    let bytes = std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?;
+    serde_json::from_slice(&bytes).context("not a valid pilot-auth-did record JSON file")
+}
+
+fn issue_pilot_profile_jwt<C: igc_net::Clock>(
+    data_dir: &std::path::Path,
+    options: &PilotProfileIssueOptions,
+    clock: &C,
+) -> Result<IssuedPilotProfileCredential> {
+    let node_secret_key = load_or_generate_node_secret_key(data_dir)?;
+    let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
+    pilot_keys.init()?;
+    let governance = GovernanceStore::for_data_dir(data_dir);
+    governance.init()?;
+
+    let identity = pilot_keys.load(&node_secret_key)?.context(
+        "pilot identity is not initialized; issue the initial pilot-auth-did record first",
+    )?;
+
+    let request = PilotProfileCredentialRequest {
+        subject: PilotProfileCredentialSubjectDraft {
+            name: options.name.clone(),
+            country: options.country.clone(),
+            additional_fields: BTreeMap::new(),
+        },
+        jti: options.jti.clone(),
+        audience: options.audience.clone(),
+        expires_in_seconds: options.expires_in_seconds,
+    };
+    let jwt = issue_pilot_profile_credential(&governance, &identity, request, clock)?;
+
+    Ok(IssuedPilotProfileCredential {
+        compact_jwt: jwt.compact().to_string(),
+        header: serde_json::to_value(jwt.header())?,
+        claims: serde_json::to_value(jwt.claims())?,
+        written_to: options.out.clone(),
+    })
+}
+
+fn pilot_profile_verification_json(
+    verification: PilotProfileCredentialVerification,
+) -> serde_json::Value {
+    match verification {
+        PilotProfileCredentialVerification::ValidAuthoritative(jwt) => serde_json::json!({
+            "status": "valid_authoritative",
+            "header": jwt.header(),
+            "claims": jwt.claims(),
+        }),
+        PilotProfileCredentialVerification::Invalid { credential, error } => serde_json::json!({
+            "status": "invalid",
+            "error": error.to_string(),
+            "header": credential.as_ref().map(|jwt| jwt.header()),
+            "claims": credential.as_ref().map(|jwt| jwt.claims()),
+        }),
+        PilotProfileCredentialVerification::UnverifiableGovernanceIncomplete {
+            credential,
+            pilot_id,
+        } => serde_json::json!({
+            "status": "unverifiable_governance_incomplete",
+            "pilot_id": pilot_id,
+            "header": credential.header(),
+            "claims": credential.claims(),
+        }),
+        PilotProfileCredentialVerification::UnverifiableGovernanceUnavailable {
+            credential,
+            pilot_id,
+        } => serde_json::json!({
+            "status": "unverifiable_governance_unavailable",
+            "pilot_id": pilot_id,
+            "header": credential.header(),
+            "claims": credential.claims(),
+        }),
+        PilotProfileCredentialVerification::UnverifiableDidWebResolution { issuer, error } => {
+            serde_json::json!({
+                "status": "unverifiable_did_web_resolution",
+                "issuer": issuer,
+                "error": error.to_string(),
+            })
+        }
+    }
+}
+
+fn load_text_input(input: &str) -> Result<String> {
+    let path = PathBuf::from(input);
+    if path.is_file() {
+        return std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display()));
+    }
+    Ok(input.to_string())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn resolve_data_dir(opt: Option<PathBuf>) -> Result<PathBuf> {
@@ -268,6 +660,34 @@ fn resolve_data_dir(opt: Option<PathBuf>) -> Result<PathBuf> {
         .map(PathBuf::from)
         .context("cannot determine home directory; set --data-dir or IGC_NET_DATA_DIR")?;
     Ok(home.join(".igc-net"))
+}
+
+fn canonical_utc_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn load_or_generate_node_secret_key(data_dir: &std::path::Path) -> Result<iroh::SecretKey> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("cannot create {}", data_dir.display()))?;
+    let store = FlatFileStore::open(data_dir);
+    match store.load_key_bytes()? {
+        Some(bytes) => Ok(iroh::SecretKey::from_bytes(&bytes)),
+        None => {
+            let mut rng = rand::rng();
+            let secret_key = iroh::SecretKey::generate(&mut rng);
+            let bytes = secret_key.to_bytes();
+            store.save_key_bytes(&bytes)?;
+            Ok(secret_key)
+        }
+    }
+}
+
+fn pilot_auth_state_status_label(status: PilotAuthDidStateStatus) -> &'static str {
+    match status {
+        PilotAuthDidStateStatus::Absent => "absent",
+        PilotAuthDidStateStatus::Tentative => "tentative",
+        PilotAuthDidStateStatus::Authoritative => "authoritative",
+    }
 }
 
 fn parse_endpoint_addr(s: &str) -> Result<iroh::EndpointAddr> {
@@ -302,5 +722,147 @@ fn parse_policy(s: &str) -> Result<FetchPolicy> {
             })
         }
         _ => anyhow::bail!("unknown policy {s:?}; use metadata-only, eager, or geo:<bbox>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use igc_net::{
+        FixedClock, HighTrustVerificationError, PilotAuthDidRecord, PilotProfileCredentialError,
+        PilotProfileCredentialVerification,
+    };
+
+    fn deterministic_secret_key(byte: u8) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[byte; 32])
+    }
+
+    #[test]
+    fn did_key_inspect_reports_public_key_and_kid() {
+        let secret_key = deterministic_secret_key(7);
+        let did = DidKey::from_public_key(secret_key.public());
+
+        let inspected = did_key_inspect_json(did.as_str()).unwrap();
+        assert_eq!(inspected["did"], serde_json::json!(did.as_str()));
+        assert_eq!(inspected["kid"], serde_json::json!(did.key_id()));
+        assert_eq!(
+            inspected["public_key_hex"],
+            serde_json::json!(secret_key.public().to_string())
+        );
+    }
+
+    #[test]
+    fn pilot_auth_record_verify_accepts_valid_record_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = PilotAuthDidRecord::issue(
+            &deterministic_secret_key(21),
+            DidKey::from_public_key(deterministic_secret_key(22).public()),
+            None,
+            "2026-05-01T09:14:00Z",
+        )
+        .unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let loaded = load_pilot_auth_record(&path).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded.record_id, record.record_id);
+    }
+
+    #[test]
+    fn pilot_profile_issue_and_verify_flow_detects_rotation_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let node_secret_key = load_or_generate_node_secret_key(data_dir).unwrap();
+        let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
+        pilot_keys.init().unwrap();
+        let governance = GovernanceStore::for_data_dir(data_dir);
+        governance.init().unwrap();
+
+        let identity = pilot_keys.load_or_generate(&node_secret_key).unwrap();
+        let initial =
+            issue_initial_pilot_auth_did_record(&governance, &identity, "2026-05-01T09:14:00Z")
+                .unwrap();
+        governance.persist_pilot_auth_did_record(&initial).unwrap();
+
+        let issued = issue_pilot_profile_jwt(
+            data_dir,
+            &PilotProfileIssueOptions {
+                jti: "urn:uuid:test-phase-9".to_string(),
+                name: Some("Alice Example".to_string()),
+                country: Some("NO".to_string()),
+                audience: Some("portal.example".to_string()),
+                expires_in_seconds: Some(600),
+                out: None,
+            },
+            &FixedClock::new(1_745_572_800),
+        )
+        .unwrap();
+
+        let valid =
+            PilotProfileCredentialVerifier::new(&governance, &FixedClock::new(1_745_572_800))
+                .with_expected_audience("portal.example")
+                .verify(&issued.compact_jwt);
+        assert!(matches!(
+            valid,
+            PilotProfileCredentialVerification::ValidAuthoritative(_)
+        ));
+
+        let next = pilot_keys
+            .generate_next_active_pilot_auth_secret_key(&node_secret_key)
+            .unwrap();
+        let rotated =
+            rotate_pilot_auth_did_record(&governance, &identity, &next, "2026-05-01T10:14:00Z")
+                .unwrap();
+        governance.persist_pilot_auth_did_record(&rotated).unwrap();
+
+        let stale =
+            PilotProfileCredentialVerifier::new(&governance, &FixedClock::new(1_745_572_800))
+                .with_expected_audience("portal.example")
+                .verify(&issued.compact_jwt);
+        assert!(matches!(
+            stale,
+            PilotProfileCredentialVerification::Invalid {
+                error: HighTrustVerificationError::Credential(
+                    PilotProfileCredentialError::HistoricalCredential { .. }
+                ),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pilot_auth_status_reports_archived_pilot_auth_dids() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let node_secret_key = load_or_generate_node_secret_key(data_dir).unwrap();
+        let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
+        pilot_keys.init().unwrap();
+        let governance = GovernanceStore::for_data_dir(data_dir);
+        governance.init().unwrap();
+
+        let identity = pilot_keys.load_or_generate(&node_secret_key).unwrap();
+        let initial =
+            issue_initial_pilot_auth_did_record(&governance, &identity, "2026-05-01T09:14:00Z")
+                .unwrap();
+        governance.persist_pilot_auth_did_record(&initial).unwrap();
+
+        let next = pilot_keys
+            .generate_next_active_pilot_auth_secret_key(&node_secret_key)
+            .unwrap();
+        let rotated =
+            rotate_pilot_auth_did_record(&governance, &identity, &next, "2026-05-01T10:14:00Z")
+                .unwrap();
+        pilot_keys
+            .replace_active_pilot_auth(&node_secret_key, &next)
+            .unwrap();
+        governance.persist_pilot_auth_did_record(&rotated).unwrap();
+
+        let status = pilot_auth_status_json(data_dir).unwrap();
+        assert_eq!(
+            status["archived_pilot_auth_dids"],
+            serde_json::json!([identity.active_pilot_auth_did().as_str()])
+        );
     }
 }

@@ -182,10 +182,7 @@ async fn import_and_ticket(
 }
 
 /// Create a `BlobTicket` string for a blob already in the iroh-blobs store.
-async fn make_ticket(
-    node: &IgcIrohNode,
-    hash_bytes: [u8; 32],
-) -> Result<String, PublishError> {
+async fn make_ticket(node: &IgcIrohNode, hash_bytes: [u8; 32]) -> Result<String, PublishError> {
     let hash = Hash::from_bytes(hash_bytes);
     let addr = node.endpoint.addr();
     let ticket = iroh_blobs::ticket::BlobTicket::new(addr, hash, BlobFormat::Raw);

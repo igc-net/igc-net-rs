@@ -305,10 +305,7 @@ fn parse_igc_into(text: &str, meta: &mut FlightMetadata) {
     meta.fix_count = Some(fix_count);
     meta.valid_fix_count = Some(valid_fix_count);
 
-    meta.started_at = build_timestamp(
-        meta.flight_date.as_deref(),
-        first_valid_fix_time.as_deref(),
-    );
+    meta.started_at = build_timestamp(meta.flight_date.as_deref(), first_valid_fix_time.as_deref());
 
     // Detect midnight crossing: if end time < start time, advance the date by
     // one day for the ended_at timestamp.
@@ -545,17 +542,13 @@ B1400004732000N00838000EA0150001500\r\n\
 ";
 
     fn fake_hash() -> Blake3Hex {
-        Blake3Hex::parse(
-            "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
-        )
-        .unwrap()
+        Blake3Hex::parse("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234")
+            .unwrap()
     }
 
     fn fake_node_id() -> NodeIdHex {
-        NodeIdHex::parse(
-            "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
-        )
-        .unwrap()
+        NodeIdHex::parse("aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd")
+            .unwrap()
     }
 
     #[test]
@@ -716,13 +709,12 @@ HFDTE310714\r\n\
 B2350004730000N00837000EA0030003000\r\n\
 B0010004732000N00838000EA0050005000\r\n\
 ";
-        let meta =
-            FlightMetadata::from_igc_bytes(
-                igc.as_bytes(),
-                fake_hash(),
-                None,
-                Some(NodeIdHex::parse("cc".repeat(32)).unwrap()),
-            );
+        let meta = FlightMetadata::from_igc_bytes(
+            igc.as_bytes(),
+            fake_hash(),
+            None,
+            Some(NodeIdHex::parse("cc".repeat(32)).unwrap()),
+        );
         assert_eq!(meta.flight_date.as_deref(), Some("2014-07-31"));
         assert_eq!(meta.started_at.as_deref(), Some("2014-07-31T23:50:00Z"));
         assert_eq!(meta.ended_at.as_deref(), Some("2014-08-01T00:10:00Z"));
@@ -737,13 +729,12 @@ HFDTE020714\r\n\
 B1200004730000N00837000EA0030003000\r\n\
 B1400004732000N00838000EA0050005000\r\n\
 ";
-        let meta =
-            FlightMetadata::from_igc_bytes(
-                igc.as_bytes(),
-                fake_hash(),
-                None,
-                Some(NodeIdHex::parse("cc".repeat(32)).unwrap()),
-            );
+        let meta = FlightMetadata::from_igc_bytes(
+            igc.as_bytes(),
+            fake_hash(),
+            None,
+            Some(NodeIdHex::parse("cc".repeat(32)).unwrap()),
+        );
         assert_eq!(meta.started_at.as_deref(), Some("2014-07-02T12:00:00Z"));
         assert_eq!(meta.ended_at.as_deref(), Some("2014-07-02T14:00:00Z"));
     }

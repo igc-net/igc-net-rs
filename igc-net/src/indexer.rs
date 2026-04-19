@@ -205,10 +205,7 @@ struct Announcement {
 /// Pass [`IndexerConfig::simple`] for tests or production without rate limiting.
 /// Use a full [`IndexerConfig`] with `rate_limit` set to enable per-source
 /// flood protection in reference node deployments.
-pub async fn run_indexer(
-    node: &IgcIrohNode,
-    config: IndexerConfig,
-) -> Result<(), IndexerError> {
+pub async fn run_indexer(node: &IgcIrohNode, config: IndexerConfig) -> Result<(), IndexerError> {
     let topic = TopicId::from_bytes(announce_topic_id());
     let handle = Arc::new(IndexerHandle {
         endpoint: node.endpoint.clone(),
@@ -291,9 +288,7 @@ async fn handle_announcement(
     rl_state: Option<RateLimitState>,
 ) -> Result<AnnouncementDisposition, IndexerError> {
     if let Err(e) = validate_payload_size(payload) {
-        return Ok(AnnouncementDisposition::Ignored(
-            e.to_string(),
-        ));
+        return Ok(AnnouncementDisposition::Ignored(e.to_string()));
     }
 
     // ── 1. Parse JSON ─────────────────────────────────────────────────────────
@@ -485,20 +480,20 @@ fn validate_payload_size(payload: &[u8]) -> Result<(), AnnouncementError> {
 }
 
 fn validate_announcement(ann: Announcement) -> Result<ValidatedAnnouncement, AnnouncementError> {
-    let igc_ticket: iroh_blobs::ticket::BlobTicket =
-        ann.igc_ticket
-            .parse::<iroh_blobs::ticket::BlobTicket>()
-            .map_err(|e| AnnouncementError::InvalidTicket {
-                ticket: "igc",
-                message: e.to_string(),
-            })?;
-    let meta_ticket: iroh_blobs::ticket::BlobTicket =
-        ann.meta_ticket
-            .parse::<iroh_blobs::ticket::BlobTicket>()
-            .map_err(|e| AnnouncementError::InvalidTicket {
-                ticket: "meta",
-                message: e.to_string(),
-            })?;
+    let igc_ticket: iroh_blobs::ticket::BlobTicket = ann
+        .igc_ticket
+        .parse::<iroh_blobs::ticket::BlobTicket>()
+        .map_err(|e| AnnouncementError::InvalidTicket {
+            ticket: "igc",
+            message: e.to_string(),
+        })?;
+    let meta_ticket: iroh_blobs::ticket::BlobTicket = ann
+        .meta_ticket
+        .parse::<iroh_blobs::ticket::BlobTicket>()
+        .map_err(|e| AnnouncementError::InvalidTicket {
+            ticket: "meta",
+            message: e.to_string(),
+        })?;
 
     if Blake3Hex::from_bytes(igc_ticket.hash().as_bytes()) != ann.igc_hash {
         return Err(AnnouncementError::TicketHashMismatch { ticket: "igc" });

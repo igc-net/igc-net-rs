@@ -75,7 +75,11 @@ async fn two_publishers_of_same_igc_create_separate_index_records() {
         .filter(|r| r.igc_hash == result_a.igc_hash)
         .collect();
 
-    assert_eq!(records.len(), 2, "expected two records for the shared igc_hash");
+    assert_eq!(
+        records.len(),
+        2,
+        "expected two records for the shared igc_hash"
+    );
     assert!(
         records
             .iter()
@@ -84,7 +88,11 @@ async fn two_publishers_of_same_igc_create_separate_index_records() {
     );
 
     let node_ids: HashSet<&str> = records.iter().map(|r| r.node_id.as_str()).collect();
-    assert_eq!(node_ids.len(), 2, "records must reference two distinct node_ids");
+    assert_eq!(
+        node_ids.len(),
+        2,
+        "records must reference two distinct node_ids"
+    );
 
     let meta_hashes: HashSet<&str> = records.iter().map(|r| r.meta_hash.as_str()).collect();
     assert_eq!(

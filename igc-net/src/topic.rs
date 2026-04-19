@@ -13,6 +13,11 @@ pub const ANNOUNCE_TOPIC_STR: &str = "igc-net/announce/v1";
 /// Nodes that publish or consume IGC_META_DOC analytics SHOULD join this topic.
 pub const ANALYTICS_TOPIC_STR: &str = "igc-net/analytics/v1";
 
+/// Derivation string for pilot-auth-did governance propagation.
+///
+/// Nodes that participate in identity governance catch-up SHOULD join this topic.
+pub const PILOT_AUTH_DID_GOVERNANCE_TOPIC_STR: &str = "igc-net/governance/pilot-auth-did/v1";
+
 /// `BLAKE3("igc-net/announce/v1")` as a 32-byte array.
 pub const ANNOUNCE_TOPIC_ID: [u8; 32] = [
     0x2f, 0x06, 0x56, 0x7e, 0x5d, 0x71, 0x48, 0xb5, 0x63, 0x49, 0xa7, 0x53, 0xf8, 0xb4, 0x07, 0xfb,
@@ -23,6 +28,12 @@ pub const ANNOUNCE_TOPIC_ID: [u8; 32] = [
 pub const ANALYTICS_TOPIC_ID: [u8; 32] = [
     0x4f, 0x29, 0x34, 0x5b, 0x69, 0x86, 0x88, 0x63, 0x51, 0xdb, 0xff, 0x97, 0xb4, 0x23, 0x1b, 0x7d,
     0x9a, 0x60, 0x1a, 0x50, 0x98, 0xf1, 0x84, 0x80, 0xc2, 0xcb, 0x4d, 0x28, 0xfb, 0xe3, 0x09, 0x50,
+];
+
+/// `BLAKE3("igc-net/governance/pilot-auth-did/v1")` as a 32-byte array.
+pub const PILOT_AUTH_DID_GOVERNANCE_TOPIC_ID: [u8; 32] = [
+    0xd5, 0xe1, 0x5e, 0xf3, 0x48, 0x40, 0x2d, 0x96, 0xdb, 0x04, 0x71, 0x12, 0xdd, 0x99, 0xb9, 0x7e,
+    0xdf, 0x13, 0x09, 0xe5, 0xa0, 0x56, 0xa5, 0xc7, 0xfa, 0xfe, 0xa9, 0xf4, 0x1a, 0x40, 0x34, 0x57,
 ];
 
 /// `BLAKE3("igc-net/announce/v1")` as a 32-byte array.
@@ -39,6 +50,11 @@ pub fn announce_topic_id() -> [u8; 32] {
 /// Defined in specs/specs_meta.md §11.1.
 pub fn analytics_topic_id() -> [u8; 32] {
     ANALYTICS_TOPIC_ID
+}
+
+/// `BLAKE3("igc-net/governance/pilot-auth-did/v1")` as a 32-byte array.
+pub fn pilot_auth_did_governance_topic_id() -> [u8; 32] {
+    PILOT_AUTH_DID_GOVERNANCE_TOPIC_ID
 }
 
 #[cfg(test)]
@@ -58,6 +74,8 @@ mod tests {
     #[test]
     fn topic_ids_are_distinct() {
         assert_ne!(announce_topic_id(), analytics_topic_id());
+        assert_ne!(announce_topic_id(), pilot_auth_did_governance_topic_id());
+        assert_ne!(analytics_topic_id(), pilot_auth_did_governance_topic_id());
     }
 
     #[test]
@@ -71,6 +89,12 @@ mod tests {
     fn analytics_topic_id_matches_derivation() {
         let expected = *blake3::hash(ANALYTICS_TOPIC_STR.as_bytes()).as_bytes();
         assert_eq!(analytics_topic_id(), expected);
+    }
+
+    #[test]
+    fn pilot_auth_did_governance_topic_id_matches_derivation() {
+        let expected = *blake3::hash(PILOT_AUTH_DID_GOVERNANCE_TOPIC_STR.as_bytes()).as_bytes();
+        assert_eq!(pilot_auth_did_governance_topic_id(), expected);
     }
 
     /// Snapshot test — verifies the announce topic ID against the value published
@@ -93,6 +117,16 @@ mod tests {
         assert_eq!(
             hex,
             "4f29345b6986886351dbff97b4231b7d9a601a5098f18480c2cb4d28fbe30950"
+        );
+    }
+
+    #[test]
+    fn pilot_auth_did_governance_topic_id_matches_spec_constant() {
+        let hex = hex::encode(pilot_auth_did_governance_topic_id());
+        // Pre-computed: BLAKE3("igc-net/governance/pilot-auth-did/v1")
+        assert_eq!(
+            hex,
+            "d5e15ef348402d96db047112dd99b97edf1309e5a056a5c7fafea9f41a403457"
         );
     }
 }
