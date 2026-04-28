@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::id::{Blake3Hex, PilotId};
 
-use super::record::PilotAuthDidRecord;
-use super::state::PilotAuthDidState;
+use super::record::{PilotAuthDidRecord, PrivateAccessRotationRecord};
+use super::state::{PilotAuthDidState, PrivateAccessRotationState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GovernanceSelectionError {
@@ -16,6 +16,40 @@ pub enum GovernanceSelectionError {
     DuplicateRecordId(Blake3Hex),
 }
 
+trait SupersessionRecord: Clone {
+    fn pilot_id(&self) -> &PilotId;
+    fn record_id(&self) -> &Blake3Hex;
+    fn supersedes(&self) -> &Option<Blake3Hex>;
+}
+
+impl SupersessionRecord for PilotAuthDidRecord {
+    fn pilot_id(&self) -> &PilotId {
+        &self.pilot_id
+    }
+
+    fn record_id(&self) -> &Blake3Hex {
+        &self.record_id
+    }
+
+    fn supersedes(&self) -> &Option<Blake3Hex> {
+        &self.supersedes
+    }
+}
+
+impl SupersessionRecord for PrivateAccessRotationRecord {
+    fn pilot_id(&self) -> &PilotId {
+        &self.pilot_id
+    }
+
+    fn record_id(&self) -> &Blake3Hex {
+        &self.record_id
+    }
+
+    fn supersedes(&self) -> &Option<Blake3Hex> {
+        &self.supersedes
+    }
+}
+
 pub fn select_pilot_auth_did_state(
     pilot_id: &PilotId,
     records: &[PilotAuthDidRecord],
@@ -24,20 +58,58 @@ pub fn select_pilot_auth_did_state(
         return Ok(PilotAuthDidState::absent(pilot_id.clone()));
     }
 
+    let selected = select_supersession_tip(pilot_id, records)?;
+
+    Ok(PilotAuthDidState {
+        pilot_id: pilot_id.clone(),
+        authoritative: selected.authoritative,
+        tentative_record_ids: selected.tentative_record_ids,
+    })
+}
+
+pub fn select_private_access_rotation_state(
+    pilot_id: &PilotId,
+    records: &[PrivateAccessRotationRecord],
+) -> Result<PrivateAccessRotationState, GovernanceSelectionError> {
+    if records.is_empty() {
+        return Ok(PrivateAccessRotationState::absent(pilot_id.clone()));
+    }
+
+    let selected = select_supersession_tip(pilot_id, records)?;
+
+    Ok(PrivateAccessRotationState {
+        pilot_id: pilot_id.clone(),
+        authoritative: selected.authoritative,
+        tentative_record_ids: selected.tentative_record_ids,
+    })
+}
+
+struct SelectedSupersessionTip<R> {
+    authoritative: Option<R>,
+    tentative_record_ids: Vec<Blake3Hex>,
+}
+
+fn select_supersession_tip<R>(
+    pilot_id: &PilotId,
+    records: &[R],
+) -> Result<SelectedSupersessionTip<R>, GovernanceSelectionError>
+where
+    R: SupersessionRecord,
+{
     let mut record_map = HashMap::with_capacity(records.len());
     for record in records {
-        if &record.pilot_id != pilot_id {
+        if record.pilot_id() != pilot_id {
             return Err(GovernanceSelectionError::MixedPilot {
                 expected: pilot_id.clone(),
-                record_id: record.record_id.clone(),
+                record_id: record.record_id().clone(),
             });
         }
         if record_map
-            .insert(record.record_id.clone(), record.clone())
+            .insert(record.record_id().clone(), record.clone())
             .is_some()
         {
             return Err(GovernanceSelectionError::DuplicateRecordId(
-                record.record_id.clone(),
+                record.record_id().clone(),
             ));
         }
     }
@@ -47,15 +119,15 @@ pub fn select_pilot_auth_did_state(
         compute_completeness(record_id, &record_map, &mut completeness);
     }
 
-    let mut children = BTreeMap::<Option<Blake3Hex>, Vec<PilotAuthDidRecord>>::new();
+    let mut children = BTreeMap::<Option<Blake3Hex>, Vec<R>>::new();
     for record in record_map.values() {
         children
-            .entry(record.supersedes.clone())
+            .entry(record.supersedes().clone())
             .or_default()
             .push(record.clone());
     }
     for siblings in children.values_mut() {
-        siblings.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        siblings.sort_by(|left, right| left.record_id().cmp(right.record_id()));
     }
 
     let authoritative = select_authoritative_tip(&children, &completeness);
@@ -63,32 +135,34 @@ pub fn select_pilot_auth_did_state(
         .values()
         .filter(|record| {
             !completeness
-                .get(&record.record_id)
+                .get(record.record_id())
                 .copied()
                 .unwrap_or(false)
         })
-        .map(|record| record.record_id.clone())
+        .map(|record| record.record_id().clone())
         .collect::<Vec<_>>();
     tentative_record_ids.sort();
 
-    Ok(PilotAuthDidState {
-        pilot_id: pilot_id.clone(),
+    Ok(SelectedSupersessionTip {
         authoritative,
         tentative_record_ids,
     })
 }
 
-fn compute_completeness(
+fn compute_completeness<R>(
     record_id: &Blake3Hex,
-    records: &HashMap<Blake3Hex, PilotAuthDidRecord>,
+    records: &HashMap<Blake3Hex, R>,
     cache: &mut HashMap<Blake3Hex, bool>,
-) -> bool {
+) -> bool
+where
+    R: SupersessionRecord,
+{
     if let Some(result) = cache.get(record_id) {
         return *result;
     }
 
     let result = match records.get(record_id) {
-        Some(record) => match &record.supersedes {
+        Some(record) => match record.supersedes() {
             None => true,
             Some(parent_id) => match records.get(parent_id) {
                 Some(_) => compute_completeness(parent_id, records, cache),
@@ -101,16 +175,19 @@ fn compute_completeness(
     result
 }
 
-fn select_authoritative_tip(
-    children: &BTreeMap<Option<Blake3Hex>, Vec<PilotAuthDidRecord>>,
+fn select_authoritative_tip<R>(
+    children: &BTreeMap<Option<Blake3Hex>, Vec<R>>,
     completeness: &HashMap<Blake3Hex, bool>,
-) -> Option<PilotAuthDidRecord> {
+) -> Option<R>
+where
+    R: SupersessionRecord,
+{
     let mut current = children.get(&None).and_then(|roots| {
         roots
             .iter()
             .find(|record| {
                 completeness
-                    .get(&record.record_id)
+                    .get(record.record_id())
                     .copied()
                     .unwrap_or(false)
             })
@@ -120,13 +197,13 @@ fn select_authoritative_tip(
     loop {
         let record = current?;
         let next = children
-            .get(&Some(record.record_id.clone()))
+            .get(&Some(record.record_id().clone()))
             .and_then(|candidates| {
                 candidates
                     .iter()
                     .find(|candidate| {
                         completeness
-                            .get(&candidate.record_id)
+                            .get(candidate.record_id())
                             .copied()
                             .unwrap_or(false)
                     })

@@ -27,6 +27,10 @@ hex         = { workspace = true }
 blake3      = { workspace = true }
 rand        = { workspace = true }
 futures     = { workspace = true }
+chrono      = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }

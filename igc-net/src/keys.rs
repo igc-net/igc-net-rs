@@ -410,66 +410,126 @@ impl PrivateAccessKeyStore {
         Self::open(data_dir.as_ref().join(PRIVATE_ACCESS_KEY_DIRNAME))
     }
 
-    /// Generate a fresh random `private_access_keypair` and store the private half.
+    /// Generate a fresh random `private_access_keypair` for `pilot_id` and store
+    /// the private half.
     ///
-    /// Fails if a key is already stored (use `delete` first to replace).
-    pub fn generate(
+    /// Fails if that pilot already has a key (use `delete_for_pilot` first to
+    /// replace with an implementation-generated key).
+    pub fn generate_for_pilot(
         &self,
+        pilot_id: &PilotId,
         node_secret_key: &iroh::SecretKey,
     ) -> Result<iroh::SecretKey, PilotKeyStoreError> {
         ensure_dir(&self.root)?;
-        if self.key_path().exists() {
+        ensure_dir(&self.pilot_dir(pilot_id))?;
+        if self.key_path(pilot_id).exists() {
             return Err(PilotKeyStoreError::AlreadyInitialized);
         }
         let mut rng = rand::rng();
         let key = generate_distinct_secret_key(&mut rng, &[&node_secret_key.to_bytes()]);
         let sealing_key = derive_sealing_key(node_secret_key);
-        write_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &key, &sealing_key)?;
+        write_encrypted_secret_key(
+            &self.key_path(pilot_id),
+            PRIVATE_ACCESS_ROLE,
+            &key,
+            &sealing_key,
+        )?;
         Ok(key.secret_key())
     }
 
-    /// Store an externally supplied private key (used during the §5 key-provisioning
-    /// handover).  Overwrites any previously stored key atomically.
-    pub fn provision(
+    /// Store an externally supplied private key for `pilot_id` (used during the
+    /// §5 key-provisioning handover).  Overwrites that pilot's previously stored
+    /// key atomically without affecting other pilots.
+    pub fn provision_for_pilot(
         &self,
+        pilot_id: &PilotId,
         private_key: &iroh::SecretKey,
         node_secret_key: &iroh::SecretKey,
     ) -> Result<(), PilotKeyStoreError> {
         ensure_dir(&self.root)?;
+        ensure_dir(&self.pilot_dir(pilot_id))?;
         let material = SensitiveKeyMaterial::from_secret_key(private_key.clone());
         let sealing_key = derive_sealing_key(node_secret_key);
-        write_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &material, &sealing_key)
+        write_encrypted_secret_key(
+            &self.key_path(pilot_id),
+            PRIVATE_ACCESS_ROLE,
+            &material,
+            &sealing_key,
+        )
     }
 
-    /// Load the stored private key. Returns `None` if no key has been provisioned.
-    pub fn load(
+    /// Load the stored private key for `pilot_id`.
+    ///
+    /// Returns `None` if no key has been provisioned for that pilot.
+    pub fn load_for_pilot(
         &self,
+        pilot_id: &PilotId,
         node_secret_key: &iroh::SecretKey,
     ) -> Result<Option<iroh::SecretKey>, PilotKeyStoreError> {
-        if !self.key_path().exists() {
+        let path = self.key_path(pilot_id);
+        if !path.exists() {
             return Ok(None);
         }
         let sealing_key = derive_sealing_key(node_secret_key);
-        let material =
-            read_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &sealing_key)?;
+        let material = read_encrypted_secret_key(&path, PRIVATE_ACCESS_ROLE, &sealing_key)?;
         Ok(Some(material.secret_key()))
     }
 
-    /// Delete the stored key (revocation / key rotation cleanup).
+    /// Load a stored private key by its public half.
+    ///
+    /// This is an interim lookup for the current gRPC POC until artifact
+    /// ownership resolution can map `raw_igc_hash` to `pilot_id` directly.
+    pub fn load_by_public_key(
+        &self,
+        public_key_hex: &str,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<Option<(PilotId, iroh::SecretKey)>, PilotKeyStoreError> {
+        if !self.root.exists() {
+            return Ok(None);
+        }
+        ensure_dir(&self.root)?;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let pilot_key_hex = entry.file_name().into_string().map_err(|_| {
+                PilotKeyStoreError::Malformed("private access pilot directory must be UTF-8")
+            })?;
+            let pilot_id = PilotId::parse(format!("{}{}", PilotId::PREFIX, pilot_key_hex))
+                .map_err(|_| {
+                    PilotKeyStoreError::Malformed(
+                        "private access pilot directory must be 32-byte lowercase hex",
+                    )
+                })?;
+            if let Some(private_key) = self.load_for_pilot(&pilot_id, node_secret_key)? {
+                if private_key.public().to_string() == public_key_hex {
+                    return Ok(Some((pilot_id, private_key)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Delete the stored key for `pilot_id` (revocation / key rotation cleanup).
     ///
     /// After this call the node loses Category 2 capability for this pilot.
     /// Callers are responsible for deleting any cached restricted plaintext
     /// per R-ACCESS-17.
-    pub fn delete(&self) -> Result<(), PilotKeyStoreError> {
-        let path = self.key_path();
+    pub fn delete_for_pilot(&self, pilot_id: &PilotId) -> Result<(), PilotKeyStoreError> {
+        let path = self.key_path(pilot_id);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
         Ok(())
     }
 
-    fn key_path(&self) -> PathBuf {
-        self.root.join(PRIVATE_ACCESS_KEY_FILENAME)
+    fn pilot_dir(&self, pilot_id: &PilotId) -> PathBuf {
+        self.root.join(pilot_id.public_key_hex())
+    }
+
+    fn key_path(&self, pilot_id: &PilotId) -> PathBuf {
+        self.pilot_dir(pilot_id).join(PRIVATE_ACCESS_KEY_FILENAME)
     }
 }
 
@@ -942,13 +1002,18 @@ mod tests {
         (store, dir)
     }
 
+    fn pilot_id(byte: u8) -> PilotId {
+        PilotId::from_public_key(deterministic_secret_key(byte).public())
+    }
+
     #[test]
     fn private_access_generate_and_load_round_trip() {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(61);
+        let pilot = pilot_id(161);
 
-        let generated = store.generate(&node_key).unwrap();
-        let loaded = store.load(&node_key).unwrap().unwrap();
+        let generated = store.generate_for_pilot(&pilot, &node_key).unwrap();
+        let loaded = store.load_for_pilot(&pilot, &node_key).unwrap().unwrap();
 
         assert_eq!(generated.to_bytes(), loaded.to_bytes());
     }
@@ -957,18 +1022,53 @@ mod tests {
     fn private_access_load_returns_none_when_absent() {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(62);
-        assert!(store.load(&node_key).unwrap().is_none());
+        assert!(
+            store
+                .load_for_pilot(&pilot_id(162), &node_key)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn private_access_generate_rejects_second_call() {
+    fn private_access_generate_rejects_second_call_for_same_pilot() {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(63);
-        store.generate(&node_key).unwrap();
+        let pilot = pilot_id(163);
+        store.generate_for_pilot(&pilot, &node_key).unwrap();
         assert!(matches!(
-            store.generate(&node_key),
+            store.generate_for_pilot(&pilot, &node_key),
             Err(PilotKeyStoreError::AlreadyInitialized)
         ));
+    }
+
+    #[test]
+    fn private_access_generate_allows_multiple_pilots() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(63);
+        let pilot_a = pilot_id(164);
+        let pilot_b = pilot_id(165);
+
+        let key_a = store.generate_for_pilot(&pilot_a, &node_key).unwrap();
+        let key_b = store.generate_for_pilot(&pilot_b, &node_key).unwrap();
+
+        assert_eq!(
+            store
+                .load_for_pilot(&pilot_a, &node_key)
+                .unwrap()
+                .unwrap()
+                .to_bytes(),
+            key_a.to_bytes()
+        );
+        assert_eq!(
+            store
+                .load_for_pilot(&pilot_b, &node_key)
+                .unwrap()
+                .unwrap()
+                .to_bytes(),
+            key_b.to_bytes()
+        );
+        assert_ne!(key_a.to_bytes(), key_b.to_bytes());
     }
 
     #[test]
@@ -976,9 +1076,12 @@ mod tests {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(64);
         let external_key = deterministic_secret_key(65);
+        let pilot = pilot_id(166);
 
-        store.provision(&external_key, &node_key).unwrap();
-        let loaded = store.load(&node_key).unwrap().unwrap();
+        store
+            .provision_for_pilot(&pilot, &external_key, &node_key)
+            .unwrap();
+        let loaded = store.load_for_pilot(&pilot, &node_key).unwrap().unwrap();
 
         assert_eq!(external_key.to_bytes(), loaded.to_bytes());
     }
@@ -987,10 +1090,15 @@ mod tests {
     fn private_access_provision_overwrites_existing_key() {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(66);
+        let pilot = pilot_id(167);
 
-        store.provision(&deterministic_secret_key(67), &node_key).unwrap();
-        store.provision(&deterministic_secret_key(68), &node_key).unwrap();
-        let loaded = store.load(&node_key).unwrap().unwrap();
+        store
+            .provision_for_pilot(&pilot, &deterministic_secret_key(67), &node_key)
+            .unwrap();
+        store
+            .provision_for_pilot(&pilot, &deterministic_secret_key(68), &node_key)
+            .unwrap();
+        let loaded = store.load_for_pilot(&pilot, &node_key).unwrap().unwrap();
 
         assert_eq!(loaded.to_bytes(), deterministic_secret_key(68).to_bytes());
     }
@@ -999,25 +1107,81 @@ mod tests {
     fn private_access_delete_clears_stored_key() {
         let (store, _dir) = temp_private_access_store();
         let node_key = deterministic_secret_key(69);
-        store.generate(&node_key).unwrap();
+        let pilot = pilot_id(168);
+        store.generate_for_pilot(&pilot, &node_key).unwrap();
 
-        store.delete().unwrap();
+        store.delete_for_pilot(&pilot).unwrap();
 
-        assert!(store.load(&node_key).unwrap().is_none());
+        assert!(store.load_for_pilot(&pilot, &node_key).unwrap().is_none());
     }
 
     #[test]
-    fn private_access_delete_is_idempotent_when_absent() {
+    fn private_access_delete_is_idempotent_when_pilot_absent() {
         let (store, _dir) = temp_private_access_store();
-        store.delete().unwrap(); // no key present — must not error
+        store.delete_for_pilot(&pilot_id(169)).unwrap();
+    }
+
+    #[test]
+    fn private_access_delete_only_removes_target_pilot() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(70);
+        let pilot_a = pilot_id(170);
+        let pilot_b = pilot_id(171);
+        let key_b = deterministic_secret_key(72);
+
+        store
+            .provision_for_pilot(&pilot_a, &deterministic_secret_key(71), &node_key)
+            .unwrap();
+        store
+            .provision_for_pilot(&pilot_b, &key_b, &node_key)
+            .unwrap();
+
+        store.delete_for_pilot(&pilot_a).unwrap();
+
+        assert!(store.load_for_pilot(&pilot_a, &node_key).unwrap().is_none());
+        assert_eq!(
+            store
+                .load_for_pilot(&pilot_b, &node_key)
+                .unwrap()
+                .unwrap()
+                .to_bytes(),
+            key_b.to_bytes()
+        );
+    }
+
+    #[test]
+    fn private_access_load_by_public_key_finds_matching_pilot() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(73);
+        let pilot_a = pilot_id(172);
+        let pilot_b = pilot_id(173);
+        let key_b = deterministic_secret_key(74);
+
+        store
+            .provision_for_pilot(&pilot_a, &deterministic_secret_key(75), &node_key)
+            .unwrap();
+        store
+            .provision_for_pilot(&pilot_b, &key_b, &node_key)
+            .unwrap();
+
+        let (matched_pilot, matched_key) = store
+            .load_by_public_key(&key_b.public().to_string(), &node_key)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(matched_pilot, pilot_b);
+        assert_eq!(matched_key.to_bytes(), key_b.to_bytes());
     }
 
     #[test]
     fn private_access_wrong_node_key_cannot_decrypt() {
         let (store, _dir) = temp_private_access_store();
-        store.generate(&deterministic_secret_key(71)).unwrap();
+        let pilot = pilot_id(174);
+        store
+            .generate_for_pilot(&pilot, &deterministic_secret_key(76))
+            .unwrap();
         assert!(matches!(
-            store.load(&deterministic_secret_key(72)),
+            store.load_for_pilot(&pilot, &deterministic_secret_key(77)),
             Err(PilotKeyStoreError::WrongNodeIdentity)
         ));
     }

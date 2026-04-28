@@ -1725,6 +1725,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "chrono",
  "clap",
  "futures",
  "hex",
@@ -1732,6 +1733,7 @@ dependencies = [
  "iroh",
  "prost",
  "rand",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-prost",

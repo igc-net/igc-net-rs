@@ -12,7 +12,7 @@ use clap::Parser;
 use tonic::transport::Server;
 use tracing::info;
 
-use igc_net::{FlatFileStore, PrivateAccessKeyStore, SeqNumStore};
+use igc_net::{FlatFileStore, IgcIrohNode, PrivateAccessKeyStore, SeqNumStore};
 
 mod service;
 
@@ -53,20 +53,25 @@ async fn main() -> Result<()> {
 
     // Load or generate the node secret key (reuses the same node.key as the CLI).
     let store = FlatFileStore::open(&data_dir);
-    store.init().await.context("failed to initialise blob store")?;
+    store
+        .init()
+        .await
+        .context("failed to initialise blob store")?;
 
     let node_secret_key = load_or_generate_node_key(&store)?;
-    let node_id = node_secret_key.public().to_string();
+    let node = IgcIrohNode::start(&data_dir)
+        .await
+        .context("failed to start igc-net node")?;
+    let node_id = node.node_id().to_string();
 
     let ctx = Arc::new(NodeContext {
-        node_id: node_id.clone(),
+        node,
         node_secret_key,
-        store,
         private_access_key_store: PrivateAccessKeyStore::for_data_dir(&data_dir),
         seq_num_store: SeqNumStore::for_data_dir(&data_dir),
     });
 
-    let service = IgcNetService::new(ctx);
+    let service = IgcNetService::new(ctx.clone());
 
     info!(node_id = %node_id, addr = %cli.grpc_addr, "igc-net gRPC service starting");
 
@@ -76,6 +81,7 @@ async fn main() -> Result<()> {
         .await
         .context("gRPC server error")?;
 
+    ctx.node.close().await;
     info!("igc-net gRPC service stopped");
     Ok(())
 }

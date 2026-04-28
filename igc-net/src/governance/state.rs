@@ -1,6 +1,6 @@
 use crate::id::{Blake3Hex, PilotId};
 
-use super::record::PilotAuthDidRecord;
+use super::record::{PilotAuthDidRecord, PrivateAccessRotationRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PilotAuthDidStateStatus {
@@ -13,6 +13,20 @@ pub enum PilotAuthDidStateStatus {
 pub struct PilotAuthDidState {
     pub pilot_id: PilotId,
     pub authoritative: Option<PilotAuthDidRecord>,
+    pub tentative_record_ids: Vec<Blake3Hex>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateAccessRotationStateStatus {
+    Absent,
+    Tentative,
+    Authoritative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateAccessRotationState {
+    pub pilot_id: PilotId,
+    pub authoritative: Option<PrivateAccessRotationRecord>,
     pub tentative_record_ids: Vec<Blake3Hex>,
 }
 
@@ -51,5 +65,33 @@ impl PilotAuthDidState {
         record_ids.sort();
         record_ids.dedup();
         record_ids
+    }
+}
+
+impl PrivateAccessRotationState {
+    pub fn absent(pilot_id: PilotId) -> Self {
+        Self {
+            pilot_id,
+            authoritative: None,
+            tentative_record_ids: Vec::new(),
+        }
+    }
+
+    pub fn status(&self) -> PrivateAccessRotationStateStatus {
+        if self.authoritative.is_some() {
+            PrivateAccessRotationStateStatus::Authoritative
+        } else if self.tentative_record_ids.is_empty() {
+            PrivateAccessRotationStateStatus::Absent
+        } else {
+            PrivateAccessRotationStateStatus::Tentative
+        }
+    }
+
+    pub fn requires_catch_up(&self) -> bool {
+        !self.tentative_record_ids.is_empty()
+    }
+
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative.is_some() && !self.requires_catch_up()
     }
 }

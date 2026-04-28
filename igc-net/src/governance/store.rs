@@ -1,16 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::governance::lookup::GovernanceLookup;
-use crate::governance::selection::{GovernanceSelectionError, select_pilot_auth_did_state};
+use crate::governance::selection::{
+    GovernanceSelectionError, select_pilot_auth_did_state, select_private_access_rotation_state,
+};
 use crate::id::PilotId;
 use crate::util::write_json_file_atomic as write_json_file_atomic_impl;
 
-use super::record::{PilotAuthDidRecord, PilotAuthDidRecordError};
-use super::state::PilotAuthDidState;
+use super::record::{
+    PilotAuthDidRecord, PilotAuthDidRecordError, PrivateAccessRotationRecord,
+    PrivateAccessRotationRecordError,
+};
+use super::state::{PilotAuthDidState, PrivateAccessRotationState};
 use super::sync::{PilotAuthDidSyncError, PilotAuthDidSyncRequest, PilotAuthDidSyncResponse};
 
 const GOVERNANCE_DIRNAME: &str = "governance";
 const PILOT_AUTH_DID_RECORDS_DIRNAME: &str = "pilot-auth-did-records";
+const PRIVATE_ACCESS_ROTATION_RECORDS_DIRNAME: &str = "private-access-rotation-records";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GovernanceStoreError {
@@ -20,6 +26,8 @@ pub enum GovernanceStoreError {
     Json(#[from] serde_json::Error),
     #[error("pilot-auth-did-record: {0}")]
     Record(#[from] PilotAuthDidRecordError),
+    #[error("private-access-rotation-record: {0}")]
+    PrivateAccessRotationRecord(#[from] PrivateAccessRotationRecordError),
     #[error("selection: {0}")]
     Selection(#[from] GovernanceSelectionError),
     #[error("sync: {0}")]
@@ -48,6 +56,7 @@ impl GovernanceStore {
 
     pub fn init(&self) -> Result<(), GovernanceStoreError> {
         std::fs::create_dir_all(self.pilot_auth_did_records_root())?;
+        std::fs::create_dir_all(self.private_access_rotation_records_root())?;
         Ok(())
     }
 
@@ -105,6 +114,61 @@ impl GovernanceStore {
         Ok(select_pilot_auth_did_state(pilot_id, &records)?)
     }
 
+    pub fn persist_private_access_rotation_record(
+        &self,
+        record: &PrivateAccessRotationRecord,
+    ) -> Result<(), GovernanceStoreError> {
+        self.init()?;
+        record.validate()?;
+        let path = self.private_access_rotation_record_path(&record.pilot_id, &record.record_id);
+        if path.exists() {
+            return Ok(());
+        }
+        write_json_file_atomic(&path, record)
+    }
+
+    pub fn load_private_access_rotation_records(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Vec<PrivateAccessRotationRecord>, GovernanceStoreError> {
+        self.init()?;
+        let dir = self.private_access_rotation_pilot_dir(pilot_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_file() {
+                    return None;
+                }
+                let path = entry.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("json")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut records = Vec::with_capacity(paths.len());
+        for path in paths {
+            let record: PrivateAccessRotationRecord =
+                serde_json::from_slice(&std::fs::read(&path)?)?;
+            record.validate()?;
+            records.push(record);
+        }
+        records.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+        Ok(records)
+    }
+
+    pub fn resolve_private_access_rotation_state(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<PrivateAccessRotationState, GovernanceStoreError> {
+        let records = self.load_private_access_rotation_records(pilot_id)?;
+        Ok(select_private_access_rotation_state(pilot_id, &records)?)
+    }
+
     pub fn prepare_pilot_auth_did_sync(
         &self,
         request: &PilotAuthDidSyncRequest,
@@ -156,6 +220,10 @@ impl GovernanceStore {
         self.root.join(PILOT_AUTH_DID_RECORDS_DIRNAME)
     }
 
+    fn private_access_rotation_records_root(&self) -> PathBuf {
+        self.root.join(PRIVATE_ACCESS_ROTATION_RECORDS_DIRNAME)
+    }
+
     fn pilot_auth_did_pilot_dir(&self, pilot_id: &PilotId) -> PathBuf {
         self.pilot_auth_did_records_root()
             .join(pilot_id.public_key_hex())
@@ -167,6 +235,20 @@ impl GovernanceStore {
         record_id: &crate::id::Blake3Hex,
     ) -> PathBuf {
         self.pilot_auth_did_pilot_dir(pilot_id)
+            .join(format!("{record_id}.json"))
+    }
+
+    fn private_access_rotation_pilot_dir(&self, pilot_id: &PilotId) -> PathBuf {
+        self.private_access_rotation_records_root()
+            .join(pilot_id.public_key_hex())
+    }
+
+    fn private_access_rotation_record_path(
+        &self,
+        pilot_id: &PilotId,
+        record_id: &crate::id::Blake3Hex,
+    ) -> PathBuf {
+        self.private_access_rotation_pilot_dir(pilot_id)
             .join(format!("{record_id}.json"))
     }
 }
@@ -184,6 +266,20 @@ impl GovernanceLookup for GovernanceStore {
         pilot_id: &PilotId,
     ) -> Result<PilotAuthDidState, GovernanceStoreError> {
         self.resolve_pilot_auth_did_state(pilot_id)
+    }
+
+    fn load_private_access_rotation_records(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Vec<PrivateAccessRotationRecord>, GovernanceStoreError> {
+        self.load_private_access_rotation_records(pilot_id)
+    }
+
+    fn resolve_private_access_rotation_state(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<PrivateAccessRotationState, GovernanceStoreError> {
+        self.resolve_private_access_rotation_state(pilot_id)
     }
 }
 
@@ -208,9 +304,10 @@ fn write_json_file_atomic<T: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::DidKey;
     use crate::{
-        PilotAuthDidStateStatus, PilotAuthDidSyncError, governance::sync::PilotAuthDidSyncRequest,
+        PilotAuthDidStateStatus, PilotAuthDidSyncError, PrivateAccessRotationRecord,
+        PrivateAccessRotationStateStatus, governance::sync::PilotAuthDidSyncRequest, id::Blake3Hex,
+        identity::DidKey,
     };
 
     use super::*;
@@ -268,6 +365,70 @@ mod tests {
             authoritative.status(),
             super::super::state::PilotAuthDidStateStatus::Authoritative
         );
+    }
+
+    #[test]
+    fn private_access_rotation_round_trip_and_resolution() {
+        let (store, _dir) = temp_store();
+        let pilot_root = deterministic_secret_key(151);
+        let first = PrivateAccessRotationRecord::issue(
+            &pilot_root,
+            deterministic_secret_key(152).public(),
+            None,
+            "2026-05-01T09:14:00Z",
+        )
+        .unwrap();
+        let second = PrivateAccessRotationRecord::issue(
+            &pilot_root,
+            deterministic_secret_key(153).public(),
+            Some(first.record_id.clone()),
+            "2026-05-01T10:14:00Z",
+        )
+        .unwrap();
+
+        store
+            .persist_private_access_rotation_record(&first)
+            .unwrap();
+        store
+            .persist_private_access_rotation_record(&second)
+            .unwrap();
+
+        let loaded = store
+            .load_private_access_rotation_records(&first.pilot_id)
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let state = store
+            .resolve_private_access_rotation_state(&first.pilot_id)
+            .unwrap();
+        assert_eq!(
+            state.status(),
+            PrivateAccessRotationStateStatus::Authoritative
+        );
+        assert_eq!(state.authoritative.unwrap(), second);
+    }
+
+    #[test]
+    fn private_access_rotation_missing_parent_is_tentative() {
+        let (store, _dir) = temp_store();
+        let pilot_root = deterministic_secret_key(154);
+        let child = PrivateAccessRotationRecord::issue(
+            &pilot_root,
+            deterministic_secret_key(155).public(),
+            Some(Blake3Hex::parse("a".repeat(64)).unwrap()),
+            "2026-05-01T10:14:00Z",
+        )
+        .unwrap();
+
+        store
+            .persist_private_access_rotation_record(&child)
+            .unwrap();
+
+        let state = store
+            .resolve_private_access_rotation_state(&child.pilot_id)
+            .unwrap();
+        assert_eq!(state.status(), PrivateAccessRotationStateStatus::Tentative);
+        assert_eq!(state.tentative_record_ids, vec![child.record_id]);
     }
 
     #[test]

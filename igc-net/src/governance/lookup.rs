@@ -1,7 +1,7 @@
 use crate::id::PilotId;
 
-use super::record::PilotAuthDidRecord;
-use super::state::PilotAuthDidState;
+use super::record::{PilotAuthDidRecord, PrivateAccessRotationRecord};
+use super::state::{PilotAuthDidState, PrivateAccessRotationState};
 use super::store::GovernanceStoreError;
 
 pub trait GovernanceLookup {
@@ -14,4 +14,14 @@ pub trait GovernanceLookup {
         &self,
         pilot_id: &PilotId,
     ) -> Result<PilotAuthDidState, GovernanceStoreError>;
+
+    fn load_private_access_rotation_records(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Vec<PrivateAccessRotationRecord>, GovernanceStoreError>;
+
+    fn resolve_private_access_rotation_state(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<PrivateAccessRotationState, GovernanceStoreError>;
 }

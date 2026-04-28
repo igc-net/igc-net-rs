@@ -6,6 +6,7 @@
 //! {root}/
 //!   blobs/<first-2-blake3-hex>/<full-64-char-blake3-hex>   ← raw blob bytes
 //!   index.ndjson                                            ← append-only flight index
+//!   artifacts.ndjson                                        ← append-only artifact registry
 //!   node.key                                                ← 32-byte Ed25519 secret key
 //! ```
 
@@ -18,7 +19,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::id::{Blake3Hex, IdentifierError, NodeIdHex};
+use crate::id::{Blake3Hex, IdentifierError, NodeIdHex, PilotId};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("identifier: {0}")]
     Identifier(#[from] IdentifierError),
+    #[error("invalid artifact registry record: {0}")]
+    InvalidArtifactRecord(&'static str),
     #[error("lock poisoned: {0}")]
     PoisonedLock(&'static str),
 }
@@ -66,6 +69,44 @@ pub struct IndexRecord {
     pub recorded_at: String,
 }
 
+// ── Artifact registry ────────────────────────────────────────────────────────
+
+/// Effective publication mode known to this node for an artifact identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationMode {
+    Public,
+    Protected,
+    Private,
+}
+
+/// One line in `artifacts.ndjson`.
+///
+/// This is the sidecar-facing artifact registry. It records the latest known
+/// service state needed by RPC handlers without changing the existing
+/// data-plane `index.ndjson` format in the same step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRegistryRecord {
+    /// Canonical flight identity.
+    pub raw_igc_hash: Blake3Hex,
+    /// Accepted or locally asserted pilot owner, when known.
+    pub pilot_id: Option<PilotId>,
+    /// Current effective mode as understood by this node.
+    pub publication_mode: PublicationMode,
+    /// Sanitized artifact hash. Present only in protected mode.
+    pub protected_hash: Option<Blake3Hex>,
+    /// Whether this node has raw IGC bytes available locally.
+    pub has_raw_igc: bool,
+    /// Whether this node has protected sanitized IGC bytes available locally.
+    pub has_protected_sanitized_igc: bool,
+    /// Whether this node has protected raw companion bytes available locally.
+    pub has_protected_raw_companion: bool,
+    /// Serving nodes currently known for this flight identity.
+    pub serving_node_ids: Vec<NodeIdHex>,
+    /// Local event timestamp for this registry update.
+    pub recorded_at: String,
+}
+
 // ── FlatFileStore ─────────────────────────────────────────────────────────────
 
 /// Content-addressed flat-file blob store keyed by BLAKE3.
@@ -86,12 +127,15 @@ pub struct FlatFileStore {
     index_records_cache: RwLock<Vec<IndexRecord>>,
     /// Cached remote discovery events paired with their line sequence number.
     discovery_events_cache: RwLock<Vec<(u64, IndexRecord)>>,
+    /// Cached latest artifact registry record per `raw_igc_hash`.
+    artifact_registry_cache: RwLock<HashMap<Blake3Hex, ArtifactRegistryRecord>>,
     /// Serializes index file appends and dedup checks that must be atomic.
     append_lock: Mutex<()>,
 }
 
 type DedupKey = (Blake3Hex, NodeIdHex);
 type LatestLocalPublishMap = HashMap<DedupKey, IndexRecord>;
+type ArtifactRegistryMap = HashMap<Blake3Hex, ArtifactRegistryRecord>;
 
 impl FlatFileStore {
     /// Open (or create) a store rooted at `root`.
@@ -105,6 +149,7 @@ impl FlatFileStore {
             latest_local_publish_cache: RwLock::new(HashMap::new()),
             index_records_cache: RwLock::new(Vec::new()),
             discovery_events_cache: RwLock::new(Vec::new()),
+            artifact_registry_cache: RwLock::new(HashMap::new()),
             append_lock: Mutex::new(()),
         }
     }
@@ -139,11 +184,16 @@ impl FlatFileStore {
             .discovery_events_cache
             .write()
             .map_err(|_| StoreError::PoisonedLock("discovery_events_cache"))?;
+        let mut artifact_registry = self
+            .artifact_registry_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_cache"))?;
         dedup.clear();
         metas.clear();
         latest_local.clear();
         index_records.clear();
         discovery_events.clear();
+        artifact_registry.clear();
         for (seq, record) in self.iter_index_file()?.enumerate() {
             let r = record?;
             dedup.insert((r.meta_hash.clone(), r.node_id.clone()));
@@ -154,6 +204,11 @@ impl FlatFileStore {
                 discovery_events.push((seq as u64, r.clone()));
             }
             index_records.push(r);
+        }
+        for record in self.iter_artifact_registry_file()? {
+            let record = record?;
+            validate_artifact_registry_record(&record)?;
+            artifact_registry.insert(record.raw_igc_hash.clone(), record);
         }
         Ok(())
     }
@@ -172,6 +227,10 @@ impl FlatFileStore {
 
     fn index_path(&self) -> PathBuf {
         self.root.join("index.ndjson")
+    }
+
+    fn artifact_registry_path(&self) -> PathBuf {
+        self.root.join("artifacts.ndjson")
     }
 
     fn key_path(&self) -> PathBuf {
@@ -325,6 +384,32 @@ impl FlatFileStore {
             >)
     }
 
+    /// Iterate all records in `artifacts.ndjson` (synchronous, for startup only).
+    fn iter_artifact_registry_file(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<ArtifactRegistryRecord, StoreError>>, StoreError> {
+        use std::io::{BufRead, BufReader};
+
+        let path = self.artifact_registry_path();
+        if !path.exists() {
+            let v: Vec<Result<ArtifactRegistryRecord, StoreError>> = Vec::new();
+            return Ok(Box::new(v.into_iter())
+                as Box<
+                    dyn Iterator<Item = Result<ArtifactRegistryRecord, StoreError>>,
+                >);
+        }
+
+        let file = std::fs::File::open(&path).map_err(StoreError::Io)?;
+        let reader = BufReader::new(file);
+        Ok(Box::new(reader.lines().map(|line| {
+            let line = line.map_err(StoreError::Io)?;
+            serde_json::from_str::<ArtifactRegistryRecord>(&line).map_err(StoreError::Json)
+        }))
+            as Box<
+                dyn Iterator<Item = Result<ArtifactRegistryRecord, StoreError>>,
+            >)
+    }
+
     /// True if the exact `(meta_hash, node_id)` pair is already recorded.
     ///
     /// Uses the in-memory dedup cache — O(1) after [`init`].
@@ -368,6 +453,48 @@ impl FlatFileStore {
             .latest_local_publish_read()?
             .get(&(igc_hash.clone(), node_id.clone()))
             .cloned())
+    }
+
+    // ── Artifact registry operations ─────────────────────────────────────────
+
+    /// Append one artifact registry record and make it the latest state for its
+    /// `raw_igc_hash`.
+    pub async fn append_artifact_registry_record(
+        &self,
+        record: &ArtifactRegistryRecord,
+    ) -> Result<(), StoreError> {
+        validate_artifact_registry_record(record)?;
+
+        let mut line = serde_json::to_string(record)?;
+        line.push('\n');
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.artifact_registry_path())
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+
+        self.artifact_registry_write()?
+            .insert(record.raw_igc_hash.clone(), record.clone());
+
+        Ok(())
+    }
+
+    /// Return the latest artifact registry state for `raw_igc_hash`.
+    pub fn artifact_registry_record(
+        &self,
+        raw_igc_hash: &Blake3Hex,
+    ) -> Result<Option<ArtifactRegistryRecord>, StoreError> {
+        Ok(self.artifact_registry_read()?.get(raw_igc_hash).cloned())
+    }
+
+    /// Return all latest artifact registry records ordered by `raw_igc_hash`.
+    pub fn artifact_registry_records(&self) -> Result<Vec<ArtifactRegistryRecord>, StoreError> {
+        let mut records: Vec<_> = self.artifact_registry_read()?.values().cloned().collect();
+        records.sort_by(|left, right| left.raw_igc_hash.cmp(&right.raw_igc_hash));
+        Ok(records)
     }
 
     // ── Key management ────────────────────────────────────────────────────────
@@ -459,6 +586,55 @@ impl FlatFileStore {
             .write()
             .map_err(|_| StoreError::PoisonedLock("discovery_events_cache"))
     }
+
+    fn artifact_registry_read(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, ArtifactRegistryMap>, StoreError> {
+        self.artifact_registry_cache
+            .read()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_cache"))
+    }
+
+    fn artifact_registry_write(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, ArtifactRegistryMap>, StoreError> {
+        self.artifact_registry_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_cache"))
+    }
+}
+
+fn validate_artifact_registry_record(record: &ArtifactRegistryRecord) -> Result<(), StoreError> {
+    match record.publication_mode {
+        PublicationMode::Protected => {
+            if record.protected_hash.is_none() {
+                return Err(StoreError::InvalidArtifactRecord(
+                    "protected mode requires protected_hash",
+                ));
+            }
+        }
+        PublicationMode::Public | PublicationMode::Private => {
+            if record.protected_hash.is_some() {
+                return Err(StoreError::InvalidArtifactRecord(
+                    "protected_hash is only valid in protected mode",
+                ));
+            }
+            if record.has_protected_sanitized_igc || record.has_protected_raw_companion {
+                return Err(StoreError::InvalidArtifactRecord(
+                    "protected artifacts are only valid in protected mode",
+                ));
+            }
+        }
+    }
+
+    let unique_serving_nodes: HashSet<_> = record.serving_node_ids.iter().collect();
+    if unique_serving_nodes.len() != record.serving_node_ids.len() {
+        return Err(StoreError::InvalidArtifactRecord(
+            "serving_node_ids must not contain duplicates",
+        ));
+    }
+
+    Ok(())
 }
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
@@ -492,7 +668,7 @@ fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{Blake3Hex, IdentifierError, NodeIdHex};
+    use crate::id::{Blake3Hex, IdentifierError, NodeIdHex, PilotId};
 
     async fn temp_store() -> (FlatFileStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -507,6 +683,10 @@ mod tests {
 
     fn node_id(ch: char) -> NodeIdHex {
         NodeIdHex::parse(ch.to_string().repeat(64)).unwrap()
+    }
+
+    fn pilot_id(ch: char) -> PilotId {
+        PilotId::parse(format!("{}{}", PilotId::PREFIX, ch.to_string().repeat(64))).unwrap()
     }
 
     #[tokio::test]
@@ -642,6 +822,122 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let records: Vec<_> = store.iter_index().unwrap().collect();
         assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifact_registry_round_trip_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatFileStore::open(dir.path());
+        store.init().await.unwrap();
+
+        let record = ArtifactRegistryRecord {
+            raw_igc_hash: hash('a'),
+            pilot_id: Some(pilot_id('b')),
+            publication_mode: PublicationMode::Protected,
+            protected_hash: Some(hash('c')),
+            has_raw_igc: true,
+            has_protected_sanitized_igc: true,
+            has_protected_raw_companion: true,
+            serving_node_ids: vec![node_id('d')],
+            recorded_at: "2026-04-28T12:00:00Z".to_string(),
+        };
+        store
+            .append_artifact_registry_record(&record)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.artifact_registry_record(&hash('a')).unwrap(),
+            Some(record.clone())
+        );
+
+        let reopened = FlatFileStore::open(dir.path());
+        reopened.init().await.unwrap();
+        assert_eq!(
+            reopened.artifact_registry_record(&hash('a')).unwrap(),
+            Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_registry_latest_record_wins() {
+        let (store, _dir) = temp_store().await;
+        store
+            .append_artifact_registry_record(&ArtifactRegistryRecord {
+                raw_igc_hash: hash('a'),
+                pilot_id: None,
+                publication_mode: PublicationMode::Private,
+                protected_hash: None,
+                has_raw_igc: true,
+                has_protected_sanitized_igc: false,
+                has_protected_raw_companion: false,
+                serving_node_ids: vec![node_id('b')],
+                recorded_at: "2026-04-28T12:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .append_artifact_registry_record(&ArtifactRegistryRecord {
+                raw_igc_hash: hash('a'),
+                pilot_id: Some(pilot_id('c')),
+                publication_mode: PublicationMode::Public,
+                protected_hash: None,
+                has_raw_igc: true,
+                has_protected_sanitized_igc: false,
+                has_protected_raw_companion: false,
+                serving_node_ids: vec![node_id('b'), node_id('d')],
+                recorded_at: "2026-04-28T12:01:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let latest = store.artifact_registry_record(&hash('a')).unwrap().unwrap();
+        assert_eq!(latest.publication_mode, PublicationMode::Public);
+        assert_eq!(latest.pilot_id, Some(pilot_id('c')));
+        assert_eq!(latest.serving_node_ids, vec![node_id('b'), node_id('d')]);
+    }
+
+    #[tokio::test]
+    async fn artifact_registry_validates_mode_specific_fields() {
+        let (store, _dir) = temp_store().await;
+        let protected_without_hash = ArtifactRegistryRecord {
+            raw_igc_hash: hash('a'),
+            pilot_id: None,
+            publication_mode: PublicationMode::Protected,
+            protected_hash: None,
+            has_raw_igc: false,
+            has_protected_sanitized_igc: true,
+            has_protected_raw_companion: false,
+            serving_node_ids: vec![],
+            recorded_at: "2026-04-28T12:00:00Z".to_string(),
+        };
+        assert!(matches!(
+            store
+                .append_artifact_registry_record(&protected_without_hash)
+                .await,
+            Err(StoreError::InvalidArtifactRecord(
+                "protected mode requires protected_hash"
+            ))
+        ));
+
+        let public_with_protected_state = ArtifactRegistryRecord {
+            raw_igc_hash: hash('a'),
+            pilot_id: None,
+            publication_mode: PublicationMode::Public,
+            protected_hash: Some(hash('b')),
+            has_raw_igc: true,
+            has_protected_sanitized_igc: false,
+            has_protected_raw_companion: false,
+            serving_node_ids: vec![],
+            recorded_at: "2026-04-28T12:00:00Z".to_string(),
+        };
+        assert!(matches!(
+            store
+                .append_artifact_registry_record(&public_with_protected_state)
+                .await,
+            Err(StoreError::InvalidArtifactRecord(
+                "protected_hash is only valid in protected mode"
+            ))
+        ));
     }
 
     #[tokio::test]

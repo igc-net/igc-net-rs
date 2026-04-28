@@ -244,7 +244,11 @@ impl SeqNumStore {
     ///
     /// Fsync + atomic rename ensures the update survives a crash (R-ACCESS-11).
     /// Returns `SeqNumStoreError::NotMonotonic` if `new_seq_num <= current`.
-    pub fn advance(&self, requester_key_hex: &str, new_seq_num: u64) -> Result<(), SeqNumStoreError> {
+    pub fn advance(
+        &self,
+        requester_key_hex: &str,
+        new_seq_num: u64,
+    ) -> Result<(), SeqNumStoreError> {
         let current = self.last_seen(requester_key_hex)?;
         if new_seq_num <= current {
             return Err(SeqNumStoreError::NotMonotonic {
@@ -371,11 +375,15 @@ mod tests {
     #[test]
     fn verify_rejects_artifact_class_mismatch() {
         let key = secret_key(13);
-        let proof =
-            sign_fetch_proof(valid_hash(), ArtifactClass::PrivateRawIgc, 1, &key).unwrap();
+        let proof = sign_fetch_proof(valid_hash(), ArtifactClass::PrivateRawIgc, 1, &key).unwrap();
 
         assert!(matches!(
-            verify_fetch_proof(&proof, &key.public(), &ArtifactClass::ProtectedRawCompanion, 0),
+            verify_fetch_proof(
+                &proof,
+                &key.public(),
+                &ArtifactClass::ProtectedRawCompanion,
+                0
+            ),
             Err(FetchProofError::ArtifactClassMismatch)
         ));
     }
@@ -448,7 +456,12 @@ mod tests {
         proof.artifact_class = ArtifactClass::ProtectedRawCompanion;
 
         assert!(matches!(
-            verify_fetch_proof(&proof, &key.public(), &ArtifactClass::ProtectedRawCompanion, 0),
+            verify_fetch_proof(
+                &proof,
+                &key.public(),
+                &ArtifactClass::ProtectedRawCompanion,
+                0
+            ),
             Err(FetchProofError::SignatureVerification)
         ));
     }
@@ -474,8 +487,7 @@ mod tests {
         (store, dir)
     }
 
-    const REQUESTER_KEY: &str =
-        "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    const REQUESTER_KEY: &str = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
     #[test]
     fn last_seen_returns_zero_for_unknown_key() {
