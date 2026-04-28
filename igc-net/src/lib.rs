@@ -1,3 +1,4 @@
+pub mod access;
 pub mod governance;
 pub mod id;
 pub mod identity;
@@ -11,6 +12,10 @@ pub mod topic;
 pub(crate) mod util;
 pub mod verify;
 
+pub use access::{
+    ArtifactClass, FetchProof, FetchProofError, SeqNumStore, SeqNumStoreError,
+    sign_fetch_proof, verify_fetch_proof,
+};
 pub use governance::{
     GovernanceLookup, GovernanceSelectionError, GovernanceStore, GovernanceStoreError,
     PilotAuthDidGossipAnnouncement, PilotAuthDidRecord, PilotAuthDidRecordError, PilotAuthDidState,
@@ -32,6 +37,7 @@ pub use identity::{
 pub use indexer::{FetchPolicy, IndexerConfig, IndexerError, RateLimitConfig, run_indexer};
 pub use keys::{
     PilotIdentity, PilotKeyStore, PilotKeyStoreError, PilotKeyStoreStatus, PilotPublicIdentity,
+    PrivateAccessKeyStore,
 };
 pub use metadata::{BoundingBox, FlightMetadata, MetadataError};
 pub use node::{IgcIrohNode, NodeError};
