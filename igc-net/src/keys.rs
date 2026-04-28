@@ -385,6 +385,94 @@ impl PilotKeyStore {
     }
 }
 
+// ── PrivateAccessKeyStore ─────────────────────────────────────────────────────
+
+const PRIVATE_ACCESS_KEY_DIRNAME: &str = "private-access-key";
+const PRIVATE_ACCESS_KEY_FILENAME: &str = "current.json";
+const PRIVATE_ACCESS_ROLE: &str = "private_access";
+
+/// Encrypted-at-rest store for a pilot's `private_access_keypair` private half.
+///
+/// The key is sealed with the same AES-256-GCM + HKDF envelope as `PilotKeyStore`.
+/// After a successful `provision` or `generate`, the node holds Category 2
+/// (`private-access`) capability for that pilot until `delete` is called.
+#[derive(Debug, Clone)]
+pub struct PrivateAccessKeyStore {
+    root: PathBuf,
+}
+
+impl PrivateAccessKeyStore {
+    pub fn open(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
+        Self::open(data_dir.as_ref().join(PRIVATE_ACCESS_KEY_DIRNAME))
+    }
+
+    /// Generate a fresh random `private_access_keypair` and store the private half.
+    ///
+    /// Fails if a key is already stored (use `delete` first to replace).
+    pub fn generate(
+        &self,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<iroh::SecretKey, PilotKeyStoreError> {
+        ensure_dir(&self.root)?;
+        if self.key_path().exists() {
+            return Err(PilotKeyStoreError::AlreadyInitialized);
+        }
+        let mut rng = rand::rng();
+        let key = generate_distinct_secret_key(&mut rng, &[&node_secret_key.to_bytes()]);
+        let sealing_key = derive_sealing_key(node_secret_key);
+        write_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &key, &sealing_key)?;
+        Ok(key.secret_key())
+    }
+
+    /// Store an externally supplied private key (used during the §5 key-provisioning
+    /// handover).  Overwrites any previously stored key atomically.
+    pub fn provision(
+        &self,
+        private_key: &iroh::SecretKey,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<(), PilotKeyStoreError> {
+        ensure_dir(&self.root)?;
+        let material = SensitiveKeyMaterial::from_secret_key(private_key.clone());
+        let sealing_key = derive_sealing_key(node_secret_key);
+        write_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &material, &sealing_key)
+    }
+
+    /// Load the stored private key. Returns `None` if no key has been provisioned.
+    pub fn load(
+        &self,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<Option<iroh::SecretKey>, PilotKeyStoreError> {
+        if !self.key_path().exists() {
+            return Ok(None);
+        }
+        let sealing_key = derive_sealing_key(node_secret_key);
+        let material =
+            read_encrypted_secret_key(&self.key_path(), PRIVATE_ACCESS_ROLE, &sealing_key)?;
+        Ok(Some(material.secret_key()))
+    }
+
+    /// Delete the stored key (revocation / key rotation cleanup).
+    ///
+    /// After this call the node loses Category 2 capability for this pilot.
+    /// Callers are responsible for deleting any cached restricted plaintext
+    /// per R-ACCESS-17.
+    pub fn delete(&self) -> Result<(), PilotKeyStoreError> {
+        let path = self.key_path();
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn key_path(&self) -> PathBuf {
+        self.root.join(PRIVATE_ACCESS_KEY_FILENAME)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 struct SensitiveKeyMaterial([u8; 32]);
 
@@ -844,5 +932,93 @@ mod tests {
 
         assert_eq!(archived, vec![retired]);
         assert_ne!(archived[0], rotated.active_pilot_auth_did());
+    }
+
+    // ── PrivateAccessKeyStore ─────────────────────────────────────────────────
+
+    fn temp_private_access_store() -> (PrivateAccessKeyStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PrivateAccessKeyStore::for_data_dir(dir.path());
+        (store, dir)
+    }
+
+    #[test]
+    fn private_access_generate_and_load_round_trip() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(61);
+
+        let generated = store.generate(&node_key).unwrap();
+        let loaded = store.load(&node_key).unwrap().unwrap();
+
+        assert_eq!(generated.to_bytes(), loaded.to_bytes());
+    }
+
+    #[test]
+    fn private_access_load_returns_none_when_absent() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(62);
+        assert!(store.load(&node_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn private_access_generate_rejects_second_call() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(63);
+        store.generate(&node_key).unwrap();
+        assert!(matches!(
+            store.generate(&node_key),
+            Err(PilotKeyStoreError::AlreadyInitialized)
+        ));
+    }
+
+    #[test]
+    fn private_access_provision_stores_external_key() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(64);
+        let external_key = deterministic_secret_key(65);
+
+        store.provision(&external_key, &node_key).unwrap();
+        let loaded = store.load(&node_key).unwrap().unwrap();
+
+        assert_eq!(external_key.to_bytes(), loaded.to_bytes());
+    }
+
+    #[test]
+    fn private_access_provision_overwrites_existing_key() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(66);
+
+        store.provision(&deterministic_secret_key(67), &node_key).unwrap();
+        store.provision(&deterministic_secret_key(68), &node_key).unwrap();
+        let loaded = store.load(&node_key).unwrap().unwrap();
+
+        assert_eq!(loaded.to_bytes(), deterministic_secret_key(68).to_bytes());
+    }
+
+    #[test]
+    fn private_access_delete_clears_stored_key() {
+        let (store, _dir) = temp_private_access_store();
+        let node_key = deterministic_secret_key(69);
+        store.generate(&node_key).unwrap();
+
+        store.delete().unwrap();
+
+        assert!(store.load(&node_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn private_access_delete_is_idempotent_when_absent() {
+        let (store, _dir) = temp_private_access_store();
+        store.delete().unwrap(); // no key present — must not error
+    }
+
+    #[test]
+    fn private_access_wrong_node_key_cannot_decrypt() {
+        let (store, _dir) = temp_private_access_store();
+        store.generate(&deterministic_secret_key(71)).unwrap();
+        assert!(matches!(
+            store.load(&deterministic_secret_key(72)),
+            Err(PilotKeyStoreError::WrongNodeIdentity)
+        ));
     }
 }
