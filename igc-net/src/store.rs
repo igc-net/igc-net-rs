@@ -129,6 +129,8 @@ pub struct FlatFileStore {
     discovery_events_cache: RwLock<Vec<(u64, IndexRecord)>>,
     /// Cached latest artifact registry record per `raw_igc_hash`.
     artifact_registry_cache: RwLock<HashMap<Blake3Hex, ArtifactRegistryRecord>>,
+    /// Cached artifact registry events paired with their append sequence.
+    artifact_registry_events_cache: RwLock<Vec<(u64, ArtifactRegistryRecord)>>,
     /// Serializes index file appends and dedup checks that must be atomic.
     append_lock: Mutex<()>,
 }
@@ -150,6 +152,7 @@ impl FlatFileStore {
             index_records_cache: RwLock::new(Vec::new()),
             discovery_events_cache: RwLock::new(Vec::new()),
             artifact_registry_cache: RwLock::new(HashMap::new()),
+            artifact_registry_events_cache: RwLock::new(Vec::new()),
             append_lock: Mutex::new(()),
         }
     }
@@ -188,12 +191,17 @@ impl FlatFileStore {
             .artifact_registry_cache
             .write()
             .map_err(|_| StoreError::PoisonedLock("artifact_registry_cache"))?;
+        let mut artifact_registry_events = self
+            .artifact_registry_events_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_events_cache"))?;
         dedup.clear();
         metas.clear();
         latest_local.clear();
         index_records.clear();
         discovery_events.clear();
         artifact_registry.clear();
+        artifact_registry_events.clear();
         for (seq, record) in self.iter_index_file()?.enumerate() {
             let r = record?;
             dedup.insert((r.meta_hash.clone(), r.node_id.clone()));
@@ -205,9 +213,10 @@ impl FlatFileStore {
             }
             index_records.push(r);
         }
-        for record in self.iter_artifact_registry_file()? {
+        for (seq, record) in self.iter_artifact_registry_file()?.enumerate() {
             let record = record?;
             validate_artifact_registry_record(&record)?;
+            artifact_registry_events.push((seq as u64, record.clone()));
             artifact_registry.insert(record.raw_igc_hash.clone(), record);
         }
         Ok(())
@@ -290,6 +299,25 @@ impl FlatFileStore {
     pub fn contains(&self, blake3_hex: &str) -> Result<bool, StoreError> {
         let blake3_hex = Blake3Hex::parse(blake3_hex)?;
         Ok(self.blob_path(&blake3_hex).exists())
+    }
+
+    /// Delete a locally stored blob by BLAKE3 hash.
+    ///
+    /// Missing blobs are treated as already deleted. This only affects the
+    /// flat-file blob store; callers that also publish through iroh-blobs must
+    /// separately stop advertising or serving that artifact class.
+    pub async fn delete_blob(&self, blake3_hex: &Blake3Hex) -> Result<bool, StoreError> {
+        let path = self.blob_path(blake3_hex);
+        match fs::remove_file(&path).await {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent).await;
+                }
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 
     // ── Index operations ──────────────────────────────────────────────────────
@@ -478,6 +506,9 @@ impl FlatFileStore {
 
         self.artifact_registry_write()?
             .insert(record.raw_igc_hash.clone(), record.clone());
+        let seq = self.artifact_registry_events_read()?.len() as u64;
+        self.artifact_registry_events_write()?
+            .push((seq, record.clone()));
 
         Ok(())
     }
@@ -495,6 +526,43 @@ impl FlatFileStore {
         let mut records: Vec<_> = self.artifact_registry_read()?.values().cloned().collect();
         records.sort_by(|left, right| left.raw_igc_hash.cmp(&right.raw_igc_hash));
         Ok(records)
+    }
+
+    /// Return all artifact registry events at or after `from_seq`.
+    ///
+    /// The sequence is scoped to this store and is the 0-based line number in
+    /// `artifacts.ndjson`.
+    pub fn artifact_registry_events_since(
+        &self,
+        from_seq: u64,
+    ) -> Result<Vec<(u64, ArtifactRegistryRecord)>, StoreError> {
+        let events = self.artifact_registry_events_read()?;
+        let start = events.partition_point(|(seq, _)| *seq < from_seq);
+        Ok(events[start..].to_vec())
+    }
+
+    /// Return the latest artifact registry event sequence, or `0` for an empty
+    /// registry. `0` is both the first valid sequence and the empty watermark;
+    /// callers that need exact emptiness should inspect the event list.
+    pub fn latest_artifact_registry_event_seq(&self) -> Result<u64, StoreError> {
+        Ok(self
+            .artifact_registry_events_read()?
+            .last()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(0))
+    }
+
+    /// Return the latest artifact registry event sequence for one
+    /// `raw_igc_hash`, if any.
+    pub fn latest_artifact_registry_event_seq_for(
+        &self,
+        raw_igc_hash: &Blake3Hex,
+    ) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .artifact_registry_events_read()?
+            .iter()
+            .rev()
+            .find_map(|(seq, record)| (&record.raw_igc_hash == raw_igc_hash).then_some(*seq)))
     }
 
     // ── Key management ────────────────────────────────────────────────────────
@@ -601,6 +669,22 @@ impl FlatFileStore {
         self.artifact_registry_cache
             .write()
             .map_err(|_| StoreError::PoisonedLock("artifact_registry_cache"))
+    }
+
+    fn artifact_registry_events_read(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, Vec<(u64, ArtifactRegistryRecord)>>, StoreError> {
+        self.artifact_registry_events_cache
+            .read()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_events_cache"))
+    }
+
+    fn artifact_registry_events_write(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, Vec<(u64, ArtifactRegistryRecord)>>, StoreError> {
+        self.artifact_registry_events_cache
+            .write()
+            .map_err(|_| StoreError::PoisonedLock("artifact_registry_events_cache"))
     }
 }
 
@@ -716,6 +800,19 @@ mod tests {
         assert!(!store.contains(&hex).unwrap());
         store.put(data).await.unwrap();
         assert!(store.contains(&hex).unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_blob_removes_local_plaintext_and_is_idempotent() {
+        let (store, _dir) = temp_store().await;
+        let data = b"restricted plaintext";
+        let hex = store.put(data).await.unwrap();
+
+        assert!(store.contains(&hex).unwrap());
+        assert!(store.delete_blob(&hex).await.unwrap());
+        assert!(!store.contains(&hex).unwrap());
+        assert!(store.get(&hex).await.unwrap().is_none());
+        assert!(!store.delete_blob(&hex).await.unwrap());
     }
 
     #[tokio::test]
@@ -855,6 +952,61 @@ mod tests {
         assert_eq!(
             reopened.artifact_registry_record(&hash('a')).unwrap(),
             Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_registry_events_are_durable_append_order_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatFileStore::open(dir.path());
+        store.init().await.unwrap();
+
+        let first = ArtifactRegistryRecord {
+            raw_igc_hash: hash('a'),
+            pilot_id: None,
+            publication_mode: PublicationMode::Public,
+            protected_hash: None,
+            has_raw_igc: true,
+            has_protected_sanitized_igc: false,
+            has_protected_raw_companion: false,
+            serving_node_ids: vec![node_id('b')],
+            recorded_at: "2026-05-01T09:00:00Z".to_string(),
+        };
+        let second = ArtifactRegistryRecord {
+            raw_igc_hash: hash('c'),
+            pilot_id: None,
+            publication_mode: PublicationMode::Private,
+            protected_hash: None,
+            has_raw_igc: true,
+            has_protected_sanitized_igc: false,
+            has_protected_raw_companion: false,
+            serving_node_ids: vec![node_id('d')],
+            recorded_at: "2026-05-01T09:01:00Z".to_string(),
+        };
+
+        store.append_artifact_registry_record(&first).await.unwrap();
+        store
+            .append_artifact_registry_record(&second)
+            .await
+            .unwrap();
+        assert_eq!(store.latest_artifact_registry_event_seq().unwrap(), 1);
+        assert_eq!(
+            store
+                .latest_artifact_registry_event_seq_for(&first.raw_igc_hash)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store.artifact_registry_events_since(1).unwrap(),
+            vec![(1, second.clone())]
+        );
+
+        let reopened = FlatFileStore::open(dir.path());
+        reopened.init().await.unwrap();
+        assert_eq!(reopened.latest_artifact_registry_event_seq().unwrap(), 1);
+        assert_eq!(
+            reopened.artifact_registry_events_since(0).unwrap(),
+            vec![(0, first), (1, second)]
         );
     }
 

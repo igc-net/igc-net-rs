@@ -1,0 +1,25 @@
+services:
+  igc-net:
+    build:
+      context: ..
+      dockerfile: igc-net-rs/Dockerfile
+    image: igc-net-rs:dev
+    command:
+      - --data-dir
+      - /data
+      - --grpc-addr
+      - 0.0.0.0:50051
+    ports:
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - igc-net-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  igc-net-data:

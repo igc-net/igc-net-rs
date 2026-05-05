@@ -151,7 +151,49 @@ The flat-file store persists:
   - `pilot_id.json`
   - `pilot_auth/current.json`
   - `pilot_auth/archive/`
+- `private-access-key/` for encrypted per-pilot private-access key custody
 - `governance/pilot-auth-did-records/` for observed identity governance history
+- `governance/private-access-rotation-records/` for private-access rotation
+  governance
+
+## Private-Access Bootstrap for Portal Integrations
+
+Private `PublishFlight` is intentionally fail-closed. A node may publish a
+private flight only when both of these are already true for the local pilot:
+
+- governance contains an authoritative `private-access-rotation-record`
+- the node has a matching `private_access_keypair` provisioned via
+  `ProvisionPrivateAccessKey`
+
+For the first `cs-archive` proof-of-concept, use a pre-seeded operator setup
+step unless a dedicated bootstrap RPC is added first:
+
+1. Start `igc-net-grpc` with the data directory that `cs-archive` will use.
+2. Ensure the local pilot identity exists in that data directory.
+3. Create and persist a `PrivateAccessRotationRecord` signed by that pilot root
+   key. Its `private_access_public_key` must be the public key corresponding to
+   the private-access secret that will be handed to igc-net.
+4. Call `ProvisionPrivateAccessKey` with:
+   - `pilot_id`
+   - the 32-byte private-access secret key seed
+   - `expected_private_access_public_key`
+5. After provisioning succeeds, the portal must discard the private-access
+   secret. igc-net owns restricted fetch signing from that point.
+6. Private `PublishFlight` can then succeed for that local pilot.
+
+Failure modes are part of the contract:
+
+- no active rotation record: `FailedPrecondition`
+- incomplete/tentative rotation chain: `FailedPrecondition`
+- provisioned key does not match the active rotation record:
+  `FailedPrecondition`
+- derived public key does not match `expected_private_access_public_key`:
+  `InvalidArgument`
+
+This bootstrap is intentionally narrower than a production grant UX. A future
+portal-facing bootstrap flow should either expose a dedicated RPC for creating
+or importing the initial rotation record, or keep the pre-seeded operator step
+as an explicit deployment prerequisite.
 
 ## Security Model and Limits
 

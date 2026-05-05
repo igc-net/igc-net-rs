@@ -73,13 +73,14 @@ async fn pilot_auth_did_gossip_propagates_updates_across_peers() {
 
     node_b.add_peer_addr(node_a.loopback_endpoint_addr().unwrap());
     node_c.add_peer_addr(node_b.loopback_endpoint_addr().unwrap());
+    node_c.add_peer_addr(node_a.loopback_endpoint_addr().unwrap());
 
     node_b
         .join_pilot_auth_did_gossip_peers(vec![node_a.iroh_node_id()])
         .await
         .unwrap();
     node_c
-        .join_pilot_auth_did_gossip_peers(vec![node_b.iroh_node_id()])
+        .join_pilot_auth_did_gossip_peers(vec![node_b.iroh_node_id(), node_a.iroh_node_id()])
         .await
         .unwrap();
 
@@ -137,4 +138,41 @@ async fn pilot_auth_did_gossip_propagates_updates_across_peers() {
     node_a.close().await;
     node_b.close().await;
     node_c.close().await;
+}
+
+#[tokio::test]
+async fn governance_topic_gossip_applies_full_pilot_auth_records() {
+    init_tracing();
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+
+    let node_a = IgcIrohNode::start(dir_a.path()).await.unwrap();
+    let node_b = IgcIrohNode::start(dir_b.path()).await.unwrap();
+
+    node_b.add_peer_addr(node_a.loopback_endpoint_addr().unwrap());
+    node_b
+        .join_governance_gossip_peers(vec![node_a.iroh_node_id()])
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let pilot_id = node_a.load_or_generate_pilot_identity().unwrap().pilot_id();
+    let initial = node_a
+        .issue_initial_pilot_auth_did_record("2026-05-01T09:14:00Z")
+        .await
+        .unwrap();
+
+    assert!(
+        wait_for_pilot_auth_record(
+            &node_b,
+            &pilot_id,
+            &initial.record_id,
+            Duration::from_secs(10)
+        )
+        .await
+    );
+
+    node_a.close().await;
+    node_b.close().await;
 }

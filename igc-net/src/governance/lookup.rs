@@ -1,7 +1,7 @@
 use crate::id::PilotId;
 
 use super::record::{PilotAuthDidRecord, PrivateAccessRotationRecord};
-use super::state::{PilotAuthDidState, PrivateAccessRotationState};
+use super::state::{FlightGovernanceState, PilotAuthDidState, PrivateAccessRotationState};
 use super::store::GovernanceStoreError;
 
 pub trait GovernanceLookup {
@@ -24,4 +24,14 @@ pub trait GovernanceLookup {
         &self,
         pilot_id: &PilotId,
     ) -> Result<PrivateAccessRotationState, GovernanceStoreError>;
+
+    fn load_flight_governance_state(
+        &self,
+        raw_igc_hash: &crate::id::Blake3Hex,
+    ) -> Result<Option<FlightGovernanceState>, GovernanceStoreError>;
+
+    fn resolve_flight_governance_state(
+        &self,
+        raw_igc_hash: &crate::id::Blake3Hex,
+    ) -> Result<Option<FlightGovernanceState>, GovernanceStoreError>;
 }

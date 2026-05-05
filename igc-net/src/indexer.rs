@@ -14,9 +14,14 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::id::{Blake3Hex, NodeIdHex};
 use crate::metadata::FlightMetadata;
 use crate::node::IgcIrohNode;
-use crate::store::{FlatFileStore, IndexRecord, IndexRecordSource};
+use crate::store::{
+    ArtifactRegistryRecord, FlatFileStore, IndexRecord, IndexRecordSource, PublicationMode,
+};
 use crate::topic::announce_topic_id;
 use crate::util::canonical_utc_now;
+
+const ARTIFACT_ANNOUNCEMENT_SCHEMA: &str = "igc-net/announcement";
+const ARTIFACT_ANNOUNCEMENT_VERSION: u8 = 1;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -57,6 +62,22 @@ enum AnnouncementError {
     MetaHashMismatch,
     #[error("igc_hash mismatch")]
     IgcHashMismatch,
+    #[error("unsupported announcement schema: {0}")]
+    UnsupportedSchema(String),
+    #[error("schema_version is unsupported: {0}")]
+    UnsupportedVersion(u8),
+    #[error("record_id mismatch")]
+    RecordIdMismatch,
+    #[error("signature verification failed")]
+    SignatureVerification,
+    #[error("signature must be 128 lowercase hex chars")]
+    SignatureEncoding,
+    #[error("announcement tickets are required")]
+    MissingTickets,
+    #[error("protected_hash presence does not match publication_mode")]
+    ProtectedHashPresence,
+    #[error("companion_tickets presence does not match publication_mode")]
+    CompanionTicketPresence,
 }
 
 #[derive(Debug)]
@@ -69,6 +90,11 @@ struct ValidatedAnnouncement {
     ann: Announcement,
     igc_ticket: iroh_blobs::ticket::BlobTicket,
     meta_ticket: iroh_blobs::ticket::BlobTicket,
+}
+
+struct ValidatedArtifactAnnouncement {
+    ann: ArtifactAnnouncement,
+    tickets: Vec<iroh_blobs::ticket::BlobTicket>,
 }
 
 #[derive(Clone)]
@@ -194,6 +220,49 @@ struct Announcement {
     meta_ticket: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ArtifactAnnouncement {
+    schema: String,
+    schema_version: u8,
+    record_id: Blake3Hex,
+    raw_igc_hash: Blake3Hex,
+    publication_mode: PublicationMode,
+    tickets: Vec<String>,
+    node_id: NodeIdHex,
+    protected_hash: Option<Blake3Hex>,
+    #[serde(default)]
+    companion_tickets: Vec<String>,
+    signature: String,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct ArtifactAnnouncementIdPayload<'a> {
+    schema: &'static str,
+    schema_version: u8,
+    raw_igc_hash: &'a Blake3Hex,
+    publication_mode: &'a PublicationMode,
+    tickets: &'a [String],
+    node_id: &'a NodeIdHex,
+    protected_hash: Option<&'a Blake3Hex>,
+    companion_tickets: &'a [String],
+    created_at: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct ArtifactAnnouncementSigningPayload<'a> {
+    schema: &'static str,
+    schema_version: u8,
+    record_id: &'a Blake3Hex,
+    raw_igc_hash: &'a Blake3Hex,
+    publication_mode: &'a PublicationMode,
+    tickets: &'a [String],
+    node_id: &'a NodeIdHex,
+    protected_hash: Option<&'a Blake3Hex>,
+    companion_tickets: &'a [String],
+    created_at: &'a str,
+}
+
 // ── run_indexer() ─────────────────────────────────────────────────────────────
 
 /// Subscribe to the announce gossip topic and process incoming announcements.
@@ -291,8 +360,33 @@ async fn handle_announcement(
         return Ok(AnnouncementDisposition::Ignored(e.to_string()));
     }
 
-    // ── 1. Parse JSON ─────────────────────────────────────────────────────────
-    let ann: Announcement = match serde_json::from_slice(payload) {
+    // ── 1. Parse JSON and dispatch legacy vs v0.3 announcements ─────────────
+    let value: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(value) => value,
+        Err(e) => {
+            return Ok(AnnouncementDisposition::Ignored(format!(
+                "malformed announcement: {e}"
+            )));
+        }
+    };
+
+    if value
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        let ann: ArtifactAnnouncement = match serde_json::from_value(value) {
+            Ok(ann) => ann,
+            Err(e) => {
+                return Ok(AnnouncementDisposition::Ignored(format!(
+                    "malformed artifact announcement: {e}"
+                )));
+            }
+        };
+        return handle_artifact_announcement(node, ann, policy, rl_cfg, rl_state).await;
+    }
+
+    let ann: Announcement = match serde_json::from_value(value) {
         Ok(a) => a,
         Err(e) => {
             return Ok(AnnouncementDisposition::Ignored(format!(
@@ -308,47 +402,8 @@ async fn handle_announcement(
     };
 
     // ── 3. Rate limit ─────────────────────────────────────────────────────────
-    if let (Some(cfg), Some(state)) = (rl_cfg, rl_state.as_ref())
-        && !cfg.trusted_node_ids.contains(&ann.ann.node_id)
-    {
-        let mut map = state.lock().await;
-        let stats = map.entry(ann.ann.node_id.clone()).or_default();
-        let now = Instant::now();
-
-        // Slide the hour window
-        if now.duration_since(stats.hour_window_start) >= Duration::from_secs(3600) {
-            stats.blobs_this_hour = 0;
-            stats.hour_window_start = now;
-        }
-        // Slide the day window
-        if now.duration_since(stats.day_window_start) >= Duration::from_secs(86400) {
-            stats.bytes_today = 0;
-            stats.day_window_start = now;
-        }
-
-        if stats.blobs_this_hour >= cfg.blobs_per_hour {
-            tracing::debug!(
-                node_id = %ann.ann.node_id,
-                limit = cfg.blobs_per_hour,
-                "rate limit exceeded (blobs/hour) — dropping announcement"
-            );
-            return Ok(AnnouncementDisposition::Ignored(
-                "rate limit exceeded (blobs/hour)".to_string(),
-            ));
-        }
-        let mb_today = stats.bytes_today as f64 / (1024.0 * 1024.0);
-        if mb_today >= cfg.mb_per_day {
-            tracing::debug!(
-                node_id = %ann.ann.node_id,
-                limit = cfg.mb_per_day,
-                "rate limit exceeded (MB/day) — dropping announcement"
-            );
-            return Ok(AnnouncementDisposition::Ignored(
-                "rate limit exceeded (MB/day)".to_string(),
-            ));
-        }
-
-        stats.blobs_this_hour += 1;
+    if let Some(reason) = apply_rate_limit(&ann.ann.node_id, rl_cfg, rl_state.as_ref()).await {
+        return Ok(AnnouncementDisposition::Ignored(reason));
     }
 
     // ── 4. Dedup ──────────────────────────────────────────────────────────────
@@ -460,6 +515,88 @@ async fn handle_announcement(
     })
 }
 
+async fn handle_artifact_announcement(
+    node: &IndexerHandle,
+    ann: ArtifactAnnouncement,
+    policy: &FetchPolicy,
+    rl_cfg: Option<&RateLimitConfig>,
+    rl_state: Option<RateLimitState>,
+) -> Result<AnnouncementDisposition, IndexerError> {
+    let ann = match validate_artifact_announcement(ann) {
+        Ok(ann) => ann,
+        Err(e) => return Ok(AnnouncementDisposition::Ignored(e.to_string())),
+    };
+
+    if let Some(reason) = apply_rate_limit(&ann.ann.node_id, rl_cfg, rl_state.as_ref()).await {
+        return Ok(AnnouncementDisposition::Ignored(reason));
+    }
+
+    let mut fetched_public_artifact = false;
+    match ann.ann.publication_mode {
+        PublicationMode::Public if should_fetch_v03_public_artifact(policy) => {
+            let bytes = fetch_blob(node, &ann.tickets[0]).await?;
+            let actual_hash = Blake3Hex::from_hash(blake3::hash(&bytes));
+            if actual_hash != ann.ann.raw_igc_hash {
+                return Ok(AnnouncementDisposition::Ignored(
+                    AnnouncementError::IgcHashMismatch.to_string(),
+                ));
+            }
+            node.store().put(&bytes).await?;
+            record_bytes_accepted(&rl_state, &ann.ann.node_id, bytes.len() as u64).await;
+            fetched_public_artifact = true;
+        }
+        PublicationMode::Protected if should_fetch_v03_public_artifact(policy) => {
+            let bytes = fetch_blob(node, &ann.tickets[0]).await?;
+            let actual_hash = Blake3Hex::from_hash(blake3::hash(&bytes));
+            if Some(&actual_hash) != ann.ann.protected_hash.as_ref() {
+                return Ok(AnnouncementDisposition::Ignored(
+                    AnnouncementError::IgcHashMismatch.to_string(),
+                ));
+            }
+            node.store().put(&bytes).await?;
+            record_bytes_accepted(&rl_state, &ann.ann.node_id, bytes.len() as u64).await;
+            fetched_public_artifact = true;
+        }
+        PublicationMode::Private | PublicationMode::Public | PublicationMode::Protected => {}
+    }
+
+    let record = ArtifactRegistryRecord {
+        raw_igc_hash: ann.ann.raw_igc_hash.clone(),
+        pilot_id: None,
+        publication_mode: ann.ann.publication_mode.clone(),
+        protected_hash: ann.ann.protected_hash.clone(),
+        has_raw_igc: ann.ann.publication_mode == PublicationMode::Public && fetched_public_artifact,
+        has_protected_sanitized_igc: ann.ann.publication_mode == PublicationMode::Protected
+            && fetched_public_artifact,
+        has_protected_raw_companion: false,
+        serving_node_ids: vec![ann.ann.node_id.clone()],
+        recorded_at: canonical_utc_now(),
+    };
+
+    if node
+        .store()
+        .artifact_registry_record(&record.raw_igc_hash)?
+        .as_ref()
+        == Some(&record)
+    {
+        return Ok(AnnouncementDisposition::Ignored(
+            "already indexed".to_string(),
+        ));
+    }
+
+    node.store()
+        .append_artifact_registry_record(&record)
+        .await?;
+    tracing::info!(
+        raw_igc_hash = %record.raw_igc_hash,
+        mode = ?record.publication_mode,
+        "indexed artifact announcement"
+    );
+    Ok(AnnouncementDisposition::Indexed {
+        fetched_igc: fetched_public_artifact,
+    })
+}
+
 /// Accumulate bytes into the rate-limit state for a publisher.  No-op when
 /// rate limiting is disabled (`rl_state` is `None`).
 async fn record_bytes_accepted(rl_state: &Option<RateLimitState>, node_id: &NodeIdHex, bytes: u64) {
@@ -469,6 +606,57 @@ async fn record_bytes_accepted(rl_state: &Option<RateLimitState>, node_id: &Node
             stats.bytes_today += bytes;
         }
     }
+}
+
+async fn apply_rate_limit(
+    node_id: &NodeIdHex,
+    rl_cfg: Option<&RateLimitConfig>,
+    rl_state: Option<&RateLimitState>,
+) -> Option<String> {
+    let (Some(cfg), Some(state)) = (rl_cfg, rl_state) else {
+        return None;
+    };
+    if cfg.trusted_node_ids.contains(node_id) {
+        return None;
+    }
+
+    let mut map = state.lock().await;
+    let stats = map.entry(node_id.clone()).or_default();
+    let now = Instant::now();
+
+    if now.duration_since(stats.hour_window_start) >= Duration::from_secs(3600) {
+        stats.blobs_this_hour = 0;
+        stats.hour_window_start = now;
+    }
+    if now.duration_since(stats.day_window_start) >= Duration::from_secs(86400) {
+        stats.bytes_today = 0;
+        stats.day_window_start = now;
+    }
+
+    if stats.blobs_this_hour >= cfg.blobs_per_hour {
+        tracing::debug!(
+            node_id = %node_id,
+            limit = cfg.blobs_per_hour,
+            "rate limit exceeded (blobs/hour) — dropping announcement"
+        );
+        return Some("rate limit exceeded (blobs/hour)".to_string());
+    }
+    let mb_today = stats.bytes_today as f64 / (1024.0 * 1024.0);
+    if mb_today >= cfg.mb_per_day {
+        tracing::debug!(
+            node_id = %node_id,
+            limit = cfg.mb_per_day,
+            "rate limit exceeded (MB/day) — dropping announcement"
+        );
+        return Some("rate limit exceeded (MB/day)".to_string());
+    }
+
+    stats.blobs_this_hour += 1;
+    None
+}
+
+fn should_fetch_v03_public_artifact(policy: &FetchPolicy) -> bool {
+    matches!(policy, FetchPolicy::Eager)
 }
 
 fn validate_payload_size(payload: &[u8]) -> Result<(), AnnouncementError> {
@@ -513,6 +701,189 @@ fn validate_announcement(ann: Announcement) -> Result<ValidatedAnnouncement, Ann
         igc_ticket,
         meta_ticket,
     })
+}
+
+fn validate_artifact_announcement(
+    ann: ArtifactAnnouncement,
+) -> Result<ValidatedArtifactAnnouncement, AnnouncementError> {
+    if ann.schema != ARTIFACT_ANNOUNCEMENT_SCHEMA {
+        return Err(AnnouncementError::UnsupportedSchema(ann.schema));
+    }
+    if ann.schema_version != ARTIFACT_ANNOUNCEMENT_VERSION {
+        return Err(AnnouncementError::UnsupportedVersion(ann.schema_version));
+    }
+    if ann.tickets.is_empty() {
+        return Err(AnnouncementError::MissingTickets);
+    }
+    match ann.publication_mode {
+        PublicationMode::Protected => {
+            if ann.protected_hash.is_none() {
+                return Err(AnnouncementError::ProtectedHashPresence);
+            }
+        }
+        PublicationMode::Public | PublicationMode::Private => {
+            if ann.protected_hash.is_some() {
+                return Err(AnnouncementError::ProtectedHashPresence);
+            }
+            if !ann.companion_tickets.is_empty() {
+                return Err(AnnouncementError::CompanionTicketPresence);
+            }
+        }
+    }
+
+    let expected_record_id = derive_artifact_announcement_record_id(
+        &ann.raw_igc_hash,
+        &ann.publication_mode,
+        &ann.tickets,
+        &ann.node_id,
+        ann.protected_hash.as_ref(),
+        &ann.companion_tickets,
+        &ann.created_at,
+    )?;
+    if ann.record_id != expected_record_id {
+        return Err(AnnouncementError::RecordIdMismatch);
+    }
+
+    let signature = decode_signature_hex(&ann.signature)?;
+    let signing_payload = artifact_announcement_signing_payload(
+        &ann.record_id,
+        &ann.raw_igc_hash,
+        &ann.publication_mode,
+        &ann.tickets,
+        &ann.node_id,
+        ann.protected_hash.as_ref(),
+        &ann.companion_tickets,
+        &ann.created_at,
+    )?;
+    node_id_public_key(&ann.node_id)?
+        .verify(&signing_payload, &signature)
+        .map_err(|_| AnnouncementError::SignatureVerification)?;
+
+    let tickets = ann
+        .tickets
+        .iter()
+        .map(|ticket| parse_artifact_ticket(ticket, "artifact"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let companion_tickets = ann
+        .companion_tickets
+        .iter()
+        .map(|ticket| parse_artifact_ticket(ticket, "companion"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for ticket in &tickets {
+        let expected_hash = match ann.publication_mode {
+            PublicationMode::Public | PublicationMode::Private => &ann.raw_igc_hash,
+            PublicationMode::Protected => ann
+                .protected_hash
+                .as_ref()
+                .expect("protected hash was checked above"),
+        };
+        validate_ticket_identity(ticket, expected_hash, &ann.node_id, "artifact")?;
+    }
+    for ticket in &companion_tickets {
+        validate_ticket_identity(ticket, &ann.raw_igc_hash, &ann.node_id, "companion")?;
+    }
+
+    Ok(ValidatedArtifactAnnouncement { ann, tickets })
+}
+
+fn parse_artifact_ticket(
+    ticket: &str,
+    name: &'static str,
+) -> Result<iroh_blobs::ticket::BlobTicket, AnnouncementError> {
+    ticket
+        .parse::<iroh_blobs::ticket::BlobTicket>()
+        .map_err(|e| AnnouncementError::InvalidTicket {
+            ticket: name,
+            message: e.to_string(),
+        })
+}
+
+fn validate_ticket_identity(
+    ticket: &iroh_blobs::ticket::BlobTicket,
+    expected_hash: &Blake3Hex,
+    expected_node_id: &NodeIdHex,
+    name: &'static str,
+) -> Result<(), AnnouncementError> {
+    if Blake3Hex::from_bytes(ticket.hash().as_bytes()) != *expected_hash {
+        return Err(AnnouncementError::TicketHashMismatch { ticket: name });
+    }
+    if NodeIdHex::from_public_key(ticket.addr().id) != *expected_node_id {
+        return Err(AnnouncementError::TicketNodeMismatch { ticket: name });
+    }
+    Ok(())
+}
+
+fn derive_artifact_announcement_record_id(
+    raw_igc_hash: &Blake3Hex,
+    publication_mode: &PublicationMode,
+    tickets: &[String],
+    node_id: &NodeIdHex,
+    protected_hash: Option<&Blake3Hex>,
+    companion_tickets: &[String],
+    created_at: &str,
+) -> Result<Blake3Hex, AnnouncementError> {
+    let payload = ArtifactAnnouncementIdPayload {
+        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
+        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
+        raw_igc_hash,
+        publication_mode,
+        tickets,
+        node_id,
+        protected_hash,
+        companion_tickets,
+        created_at,
+    };
+    let bytes = json_canon::to_vec(&payload)?;
+    Ok(Blake3Hex::from_hash(blake3::hash(&bytes)))
+}
+
+fn artifact_announcement_signing_payload(
+    record_id: &Blake3Hex,
+    raw_igc_hash: &Blake3Hex,
+    publication_mode: &PublicationMode,
+    tickets: &[String],
+    node_id: &NodeIdHex,
+    protected_hash: Option<&Blake3Hex>,
+    companion_tickets: &[String],
+    created_at: &str,
+) -> Result<Vec<u8>, AnnouncementError> {
+    let payload = ArtifactAnnouncementSigningPayload {
+        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
+        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
+        record_id,
+        raw_igc_hash,
+        publication_mode,
+        tickets,
+        node_id,
+        protected_hash,
+        companion_tickets,
+        created_at,
+    };
+    Ok(json_canon::to_vec(&payload)?)
+}
+
+fn decode_signature_hex(value: &str) -> Result<iroh::Signature, AnnouncementError> {
+    if value.len() != 128
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(AnnouncementError::SignatureEncoding);
+    }
+    let bytes = hex::decode(value).map_err(|_| AnnouncementError::SignatureEncoding)?;
+    let signature_bytes: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| AnnouncementError::SignatureEncoding)?;
+    Ok(iroh::Signature::from_bytes(&signature_bytes))
+}
+
+fn node_id_public_key(node_id: &NodeIdHex) -> Result<iroh::PublicKey, AnnouncementError> {
+    let bytes = hex::decode(node_id.as_str()).map_err(|_| AnnouncementError::SignatureEncoding)?;
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| AnnouncementError::SignatureEncoding)?;
+    iroh::PublicKey::from_bytes(&key_bytes).map_err(|_| AnnouncementError::SignatureEncoding)
 }
 
 async fn record_remote_announcement(

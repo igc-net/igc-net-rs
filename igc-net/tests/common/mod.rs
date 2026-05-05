@@ -49,6 +49,29 @@ pub async fn wait_for_index_record(
     }
 }
 
+/// Poll artifact registry until a record for `raw_igc_hash` appears, or
+/// `timeout` elapses. Returns `true` if found.
+pub async fn wait_for_artifact_registry_record(
+    store: &igc_net::FlatFileStore,
+    raw_igc_hash: &igc_net::Blake3Hex,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if store
+            .artifact_registry_record(raw_igc_hash)
+            .unwrap()
+            .is_some()
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Poll `store`'s index until at least `expected` records for `igc_hash`
 /// appear, or `timeout` elapses. Returns `true` if the count was reached.
 pub async fn wait_for_index_count(

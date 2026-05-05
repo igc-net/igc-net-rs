@@ -17,12 +17,16 @@ pub use access::{
     verify_fetch_proof,
 };
 pub use governance::{
-    GovernanceLookup, GovernanceSelectionError, GovernanceStore, GovernanceStoreError,
-    PilotAuthDidGossipAnnouncement, PilotAuthDidRecord, PilotAuthDidRecordError, PilotAuthDidState,
-    PilotAuthDidStateStatus, PilotAuthDidSyncError, PilotAuthDidSyncRequest,
-    PilotAuthDidSyncResponse, PilotAuthDidWorkflowError, PrivateAccessRotationRecord,
-    PrivateAccessRotationRecordError, PrivateAccessRotationState, PrivateAccessRotationStateStatus,
-    issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
+    ClaimApprovalRecord, ClaimChallengeRecord, ClaimResolutionOutcome, ClaimResolutionRecord,
+    DeletionRequestRecord, FlightGovernanceRecordError, FlightGovernanceState,
+    FlightGovernanceStatus, GovernanceLookup, GovernanceRecord, GovernanceRecordParseError,
+    GovernanceSelectionError, GovernanceStore, GovernanceStoreError, IdentityRecoveryBasis,
+    IdentityRecoveryRecord, OwnerClaimRecord, PilotAuthDidGossipAnnouncement, PilotAuthDidRecord,
+    PilotAuthDidRecordError, PilotAuthDidState, PilotAuthDidStateStatus, PilotAuthDidSyncError,
+    PilotAuthDidSyncRequest, PilotAuthDidSyncResponse, PilotAuthDidWorkflowError,
+    PrivateAccessRotationRecord, PrivateAccessRotationRecordError, PrivateAccessRotationState,
+    PrivateAccessRotationStateStatus, PublicationModeRecord, ResolverProfile, RosterUpdateAction,
+    RosterUpdateRecord, issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
 };
 pub use id::{Blake3Hex, IdentifierError, NodeIdHex, PilotId};
 #[cfg(feature = "did-web")]
@@ -42,14 +46,18 @@ pub use keys::{
 };
 pub use metadata::{BoundingBox, FlightMetadata, MetadataError};
 pub use node::{IgcIrohNode, NodeError};
-pub use publish::{PublishError, PublishResult, publish};
+pub use publish::{
+    PrivatePublishResult, ProtectedPublishResult, PublishError, PublishResult, publish,
+    publish_private, publish_protected, sanitize_protected_igc,
+};
 pub use store::{
     ArtifactRegistryRecord, FlatFileStore, IndexRecord, IndexRecordSource, PublicationMode,
     StoreError,
 };
 pub use topic::{
-    ANALYTICS_TOPIC_STR, ANNOUNCE_TOPIC_STR, PILOT_AUTH_DID_GOVERNANCE_TOPIC_STR,
-    analytics_topic_id, announce_topic_id, pilot_auth_did_governance_topic_id,
+    ANALYTICS_TOPIC_STR, ANNOUNCE_TOPIC_STR, GOVERNANCE_TOPIC_STR,
+    PILOT_AUTH_DID_GOVERNANCE_TOPIC_STR, analytics_topic_id, announce_topic_id,
+    governance_topic_id, pilot_auth_did_governance_topic_id,
 };
 pub use verify::{
     HighTrustVerificationError, PilotProfileCredentialVerification, PilotProfileCredentialVerifier,

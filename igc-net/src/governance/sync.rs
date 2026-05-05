@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::{Blake3Hex, PilotId};
 
-use super::record::PilotAuthDidRecord;
+use super::record::{
+    ClaimApprovalRecord, ClaimChallengeRecord, ClaimResolutionRecord, DeletionRequestRecord,
+    IdentityRecoveryRecord, OwnerClaimRecord, PilotAuthDidRecord, PrivateAccessRotationRecord,
+    PublicationModeRecord, RosterUpdateRecord,
+};
 use super::state::PilotAuthDidState;
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +27,67 @@ pub enum PilotAuthDidSyncError {
 pub struct PilotAuthDidGossipAnnouncement {
     pub pilot_id: PilotId,
     pub record_id: Blake3Hex,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GovernanceRecordParseError {
+    #[error("JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("governance record is missing string schema field")]
+    MissingSchema,
+    #[error("unsupported governance record schema: {0}")]
+    UnsupportedSchema(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernanceRecord {
+    OwnerClaim(OwnerClaimRecord),
+    ClaimApproval(ClaimApprovalRecord),
+    ClaimChallenge(ClaimChallengeRecord),
+    ClaimResolution(ClaimResolutionRecord),
+    IdentityRecovery(IdentityRecoveryRecord),
+    DeletionRequest(DeletionRequestRecord),
+    PrivateAccessRotation(PrivateAccessRotationRecord),
+    PublicationMode(PublicationModeRecord),
+    PilotAuthDid(PilotAuthDidRecord),
+    RosterUpdate(RosterUpdateRecord),
+}
+
+impl GovernanceRecord {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, GovernanceRecordParseError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        Self::from_value(value)
+    }
+
+    pub fn from_value(value: serde_json::Value) -> Result<Self, GovernanceRecordParseError> {
+        let schema = value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(GovernanceRecordParseError::MissingSchema)?;
+        match schema {
+            "igc-net/claim" => Ok(Self::OwnerClaim(serde_json::from_value(value)?)),
+            "igc-net/claim-approval" => Ok(Self::ClaimApproval(serde_json::from_value(value)?)),
+            "igc-net/claim-challenge" => Ok(Self::ClaimChallenge(serde_json::from_value(value)?)),
+            "igc-net/claim-resolution" => Ok(Self::ClaimResolution(serde_json::from_value(value)?)),
+            "igc-net/identity-recovery" => {
+                Ok(Self::IdentityRecovery(serde_json::from_value(value)?))
+            }
+            "igc-net/deletion-request" => Ok(Self::DeletionRequest(serde_json::from_value(value)?)),
+            "igc-net/private-access-rotation-record" => {
+                Ok(Self::PrivateAccessRotation(serde_json::from_value(value)?))
+            }
+            "igc-net/publication-mode-record" => {
+                Ok(Self::PublicationMode(serde_json::from_value(value)?))
+            }
+            "igc-net/pilot-auth-did-record" => {
+                Ok(Self::PilotAuthDid(serde_json::from_value(value)?))
+            }
+            "igc-net/roster-update" => Ok(Self::RosterUpdate(serde_json::from_value(value)?)),
+            schema => Err(GovernanceRecordParseError::UnsupportedSchema(
+                schema.to_string(),
+            )),
+        }
+    }
 }
 
 impl PilotAuthDidGossipAnnouncement {

@@ -19,9 +19,9 @@ use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 use iroh_gossip::proto::TopicId;
 
 use crate::governance::{
-    GovernanceStore, GovernanceStoreError, PilotAuthDidGossipAnnouncement, PilotAuthDidState,
-    PilotAuthDidSyncRequest, PilotAuthDidSyncResponse, PilotAuthDidWorkflowError,
-    issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
+    GovernanceRecord, GovernanceStore, GovernanceStoreError, PilotAuthDidGossipAnnouncement,
+    PilotAuthDidState, PilotAuthDidSyncRequest, PilotAuthDidSyncResponse,
+    PilotAuthDidWorkflowError, issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
 };
 use crate::id::NodeIdHex;
 use crate::id::PilotId;
@@ -29,7 +29,7 @@ use crate::keys::{
     PilotIdentity, PilotKeyStore, PilotKeyStoreError, PilotKeyStoreStatus, PilotPublicIdentity,
 };
 use crate::store::{FlatFileStore, StoreError};
-use crate::topic::{announce_topic_id, pilot_auth_did_governance_topic_id};
+use crate::topic::{announce_topic_id, governance_topic_id, pilot_auth_did_governance_topic_id};
 
 const GOVERNANCE_SYNC_ALPN: &[u8] = b"igc-net/governance-sync/v1";
 const GOVERNANCE_SYNC_MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -113,6 +113,8 @@ pub struct IgcIrohNode {
     /// announcements on this topic. Receivers then use the pull-sync transport
     /// to fetch any missing records from the delivering peer.
     governance_sender: GossipSender,
+    /// Persistent normative governance topic sender.
+    governance_record_sender: GossipSender,
     node_id: NodeIdHex,
     node_key_bytes: [u8; 32],
     pilot_keys: PilotKeyStore,
@@ -181,6 +183,17 @@ async fn broadcast_pilot_auth_did_gossip_announcement(
     announcement: &PilotAuthDidGossipAnnouncement,
 ) -> Result<(), NodeError> {
     let payload = serde_json::to_vec(announcement)?;
+    sender
+        .broadcast(payload.into())
+        .await
+        .map_err(|err| NodeError::GovernanceGossipBroadcast(err.to_string()))
+}
+
+async fn broadcast_governance_record<T: serde::Serialize>(
+    sender: &GossipSender,
+    record: &T,
+) -> Result<(), NodeError> {
+    let payload = serde_json::to_vec(record)?;
     sender
         .broadcast(payload.into())
         .await
@@ -390,6 +403,65 @@ impl IgcIrohNode {
             }
         });
 
+        // ── Persistent normative governance subscription ─────────────────────
+        let governance_record_topic = TopicId::from_bytes(governance_topic_id());
+        let (governance_record_sender, mut governance_record_receiver) = gossip
+            .subscribe(governance_record_topic, vec![])
+            .await
+            .map_err(|e| NodeError::GovernanceGossipSubscribe(e.to_string()))?
+            .split();
+        let governance_record_store = governance.clone();
+        let governance_record_local_endpoint_id = endpoint.id();
+        tokio::spawn(async move {
+            while let Some(event) = governance_record_receiver.next().await {
+                match event {
+                    Ok(GossipEvent::Received(message)) => {
+                        if message.delivered_from == governance_record_local_endpoint_id {
+                            continue;
+                        }
+                        let record = match GovernanceRecord::from_slice(&message.content) {
+                            Ok(record) => record,
+                            Err(err) => {
+                                tracing::warn!(
+                                    peer = %message.delivered_from,
+                                    error = %err,
+                                    "ignoring invalid governance gossip payload"
+                                );
+                                continue;
+                            }
+                        };
+                        match governance_record_store.apply_governance_record(&record) {
+                            Ok(true) => tracing::info!(
+                                peer = %message.delivered_from,
+                                "applied governance record from gossip"
+                            ),
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(
+                                peer = %message.delivered_from,
+                                error = %err,
+                                "ignoring invalid governance gossip payload"
+                            ),
+                        }
+                    }
+                    Ok(GossipEvent::NeighborUp(peer)) => {
+                        tracing::debug!(%peer, "governance neighbor up");
+                    }
+                    Ok(GossipEvent::NeighborDown(peer)) => {
+                        tracing::debug!(%peer, "governance neighbor down");
+                    }
+                    Ok(GossipEvent::Lagged) => {
+                        tracing::warn!(
+                            "governance gossip receiver lagged; some updates may require catch-up"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "governance gossip subscription closed");
+                        break;
+                    }
+                }
+            }
+        });
+
         tracing::info!(%node_id, data_dir = %data_dir.display(), "igc-net node started");
 
         Ok(Self {
@@ -401,6 +473,7 @@ impl IgcIrohNode {
             _router: router,
             announce_sender,
             governance_sender,
+            governance_record_sender,
             node_id,
             node_key_bytes: key_bytes,
             pilot_keys,
@@ -486,6 +559,28 @@ impl IgcIrohNode {
             .map_err(|err| NodeError::GovernanceGossipJoin(err.to_string()))
     }
 
+    /// Join known peers on the normative governance gossip topic.
+    ///
+    /// Call this after populating peer addresses for direct/private networks.
+    /// Received records are validated, persisted idempotently, and then used by
+    /// local governance state resolution.
+    pub async fn join_governance_gossip_peers(
+        &self,
+        peers: Vec<iroh::PublicKey>,
+    ) -> Result<(), NodeError> {
+        let peers = peers
+            .into_iter()
+            .filter(|peer| *peer != self.iroh_node_id())
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return Ok(());
+        }
+        self.governance_record_sender
+            .join_peers(peers)
+            .await
+            .map_err(|err| NodeError::GovernanceGossipJoin(err.to_string()))
+    }
+
     /// The persistent announce-topic sender.
     ///
     /// Use this to broadcast on the announce topic without creating a new
@@ -494,11 +589,23 @@ impl IgcIrohNode {
         &self.announce_sender
     }
 
+    /// Broadcast a full governance record on the normative governance topic.
+    ///
+    /// Callers must persist the record locally before broadcasting so a local
+    /// restart does not lose authority that was already advertised.
+    pub async fn broadcast_governance_record<T: serde::Serialize>(
+        &self,
+        record: &T,
+    ) -> Result<(), NodeError> {
+        broadcast_governance_record(&self.governance_record_sender, record).await
+    }
+
     async fn broadcast_pilot_auth_did_update(
         &self,
         record: &crate::PilotAuthDidRecord,
     ) -> Result<(), NodeError> {
         let announcement = PilotAuthDidGossipAnnouncement::from_record(record);
+        broadcast_governance_record(&self.governance_record_sender, record).await?;
         broadcast_pilot_auth_did_gossip_announcement(&self.governance_sender, &announcement).await
     }
 
@@ -664,7 +771,7 @@ impl IgcIrohNode {
             .ok_or(NodeError::NoLoopbackSocket)
     }
 
-    fn node_secret_key(&self) -> iroh::SecretKey {
+    pub(crate) fn node_secret_key(&self) -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&self.node_key_bytes)
     }
 }

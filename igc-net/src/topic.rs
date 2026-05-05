@@ -13,6 +13,10 @@ pub const ANNOUNCE_TOPIC_STR: &str = "igc-net/announce/v1";
 /// Nodes that publish or consume IGC_META_DOC analytics SHOULD join this topic.
 pub const ANALYTICS_TOPIC_STR: &str = "igc-net/analytics/v1";
 
+/// Derivation string for the normative governance topic.
+/// All governance records defined by `55-governance-sync.md` propagate here.
+pub const GOVERNANCE_TOPIC_STR: &str = "igc-net/governance/v1";
+
 /// Derivation string for pilot-auth-did governance propagation.
 ///
 /// Nodes that participate in identity governance catch-up SHOULD join this topic.
@@ -28,6 +32,12 @@ pub const ANNOUNCE_TOPIC_ID: [u8; 32] = [
 pub const ANALYTICS_TOPIC_ID: [u8; 32] = [
     0x4f, 0x29, 0x34, 0x5b, 0x69, 0x86, 0x88, 0x63, 0x51, 0xdb, 0xff, 0x97, 0xb4, 0x23, 0x1b, 0x7d,
     0x9a, 0x60, 0x1a, 0x50, 0x98, 0xf1, 0x84, 0x80, 0xc2, 0xcb, 0x4d, 0x28, 0xfb, 0xe3, 0x09, 0x50,
+];
+
+/// `BLAKE3("igc-net/governance/v1")` as a 32-byte array.
+pub const GOVERNANCE_TOPIC_ID: [u8; 32] = [
+    0xb5, 0x66, 0x7d, 0x06, 0x81, 0x7e, 0xb4, 0x90, 0xa5, 0x82, 0x0b, 0x5a, 0x77, 0x50, 0xa4, 0x60,
+    0xea, 0x00, 0x32, 0x42, 0x66, 0x34, 0x00, 0x27, 0xcd, 0x4c, 0xf3, 0x09, 0xd2, 0x74, 0x45, 0x81,
 ];
 
 /// `BLAKE3("igc-net/governance/pilot-auth-did/v1")` as a 32-byte array.
@@ -52,6 +62,11 @@ pub fn analytics_topic_id() -> [u8; 32] {
     ANALYTICS_TOPIC_ID
 }
 
+/// `BLAKE3("igc-net/governance/v1")` as a 32-byte array.
+pub fn governance_topic_id() -> [u8; 32] {
+    GOVERNANCE_TOPIC_ID
+}
+
 /// `BLAKE3("igc-net/governance/pilot-auth-did/v1")` as a 32-byte array.
 pub fn pilot_auth_did_governance_topic_id() -> [u8; 32] {
     PILOT_AUTH_DID_GOVERNANCE_TOPIC_ID
@@ -74,8 +89,11 @@ mod tests {
     #[test]
     fn topic_ids_are_distinct() {
         assert_ne!(announce_topic_id(), analytics_topic_id());
+        assert_ne!(announce_topic_id(), governance_topic_id());
         assert_ne!(announce_topic_id(), pilot_auth_did_governance_topic_id());
+        assert_ne!(analytics_topic_id(), governance_topic_id());
         assert_ne!(analytics_topic_id(), pilot_auth_did_governance_topic_id());
+        assert_ne!(governance_topic_id(), pilot_auth_did_governance_topic_id());
     }
 
     #[test]
@@ -89,6 +107,12 @@ mod tests {
     fn analytics_topic_id_matches_derivation() {
         let expected = *blake3::hash(ANALYTICS_TOPIC_STR.as_bytes()).as_bytes();
         assert_eq!(analytics_topic_id(), expected);
+    }
+
+    #[test]
+    fn governance_topic_id_matches_derivation() {
+        let expected = *blake3::hash(GOVERNANCE_TOPIC_STR.as_bytes()).as_bytes();
+        assert_eq!(governance_topic_id(), expected);
     }
 
     #[test]
@@ -117,6 +141,16 @@ mod tests {
         assert_eq!(
             hex,
             "4f29345b6986886351dbff97b4231b7d9a601a5098f18480c2cb4d28fbe30950"
+        );
+    }
+
+    #[test]
+    fn governance_topic_id_matches_spec_constant() {
+        let hex = hex::encode(governance_topic_id());
+        // Pre-computed: BLAKE3("igc-net/governance/v1")
+        assert_eq!(
+            hex,
+            "b5667d06817eb490a5820b5a7750a460ea00324266340027cd4cf309d2744581"
         );
     }
 

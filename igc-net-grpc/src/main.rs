@@ -13,15 +13,8 @@ use tonic::transport::Server;
 use tracing::info;
 
 use igc_net::{FlatFileStore, IgcIrohNode, PrivateAccessKeyStore, SeqNumStore};
-
-mod service;
-
-pub mod proto {
-    tonic::include_proto!("igc_net.v0");
-}
-
-use proto::igc_net_server::IgcNetServer;
-use service::{IgcNetService, NodeContext};
+use igc_net_grpc::proto::igc_net_server::IgcNetServer;
+use igc_net_grpc::service::{IgcNetService, NodeContext};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
