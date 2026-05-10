@@ -120,7 +120,7 @@ impl From<IndexerError> for AppError {
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     let node = IgcIrohNode::start("./data").await?;
-    let cfg = IndexerConfig::simple(FetchPolicy::MetadataOnly, vec![]);
+    let cfg = IndexerConfig::simple(FetchPolicy::IndexOnly, vec![]);
     run_indexer(&node, cfg).await?;
     node.close().await;
     Ok(())
@@ -129,7 +129,7 @@ async fn main() -> Result<(), AppError> {
 
 Available fetch policies:
 
-- `FetchPolicy::MetadataOnly`
+- `FetchPolicy::IndexOnly`
 - `FetchPolicy::Eager`
 - `FetchPolicy::GeoFiltered { ... }`
 
