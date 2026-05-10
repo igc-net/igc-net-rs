@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -13,7 +15,10 @@ use crate::identity::DidKey;
 use crate::util::write_json_file_atomic as write_json_file_atomic_impl;
 
 const PILOT_KEYS_DIRNAME: &str = "pilot-keys";
+const PILOT_CREDENTIALS_DIRNAME: &str = "pilot-credentials";
 const PILOT_ID_FILENAME: &str = "pilot_id.json";
+const PILOT_PROFILE_FILENAME: &str = "profile.json";
+const PILOT_CREDENTIAL_FILENAME: &str = "credential.json";
 const ACTIVE_PILOT_AUTH_DIRNAME: &str = "pilot_auth";
 const ACTIVE_PILOT_AUTH_FILENAME: &str = "current.json";
 const ARCHIVE_DIRNAME: &str = "archive";
@@ -49,6 +54,10 @@ pub enum PilotKeyStoreError {
     WrongNodeIdentity,
     #[error("unsafe filesystem permissions on {path}: mode {mode:o}")]
     UnsafePermissions { path: PathBuf, mode: u32 },
+    #[error("credential hash failed: {0}")]
+    CredentialHash(String),
+    #[error("pilot credential is malformed")]
+    MalformedCredential,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +76,27 @@ pub struct PilotPublicIdentity {
     pub pilot_id: PilotId,
     pub pilot_id_public_key_hex: String,
     pub active_pilot_auth_public_key_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PilotProfile {
+    pub display_name: String,
+    pub country: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PilotPublicIdentityWithProfile {
+    pub pilot_id: PilotId,
+    pub pilot_id_public_key_hex: String,
+    pub active_pilot_auth_public_key_hex: String,
+    pub display_name: String,
+    pub country: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PilotCredentialFile {
+    pub argon2id_hash: String,
+    pub created_at: String,
 }
 
 pub struct PilotIdentity {
@@ -131,6 +161,288 @@ impl PilotIdentity {
     }
 }
 
+// ── MultiPilotKeyStore ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MultiPilotKeyStore {
+    root: PathBuf,
+}
+
+impl MultiPilotKeyStore {
+    pub fn open(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
+        Self::open(data_dir.as_ref().join(PILOT_KEYS_DIRNAME))
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn init(&self) -> Result<(), PilotKeyStoreError> {
+        ensure_dir(self.root_dir())
+    }
+
+    pub fn generate_pilot(
+        &self,
+        display_name: impl Into<String>,
+        country: Option<String>,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<PilotIdentity, PilotKeyStoreError> {
+        self.init()?;
+        let profile = PilotProfile {
+            display_name: display_name.into(),
+            country,
+        };
+        validate_profile(&profile)?;
+
+        let staging_dir = self.fresh_staging_dir();
+        let staging_store = PilotKeyStore::open(&staging_dir);
+        let identity = match staging_store.generate(node_secret_key) {
+            Ok(identity) => identity,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(err);
+            }
+        };
+        if let Err(err) = write_profile(&profile_path(&staging_dir), &profile) {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+
+        let pilot_dir = self.pilot_dir(&identity.pilot_id());
+        if pilot_dir.exists() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(PilotKeyStoreError::AlreadyInitialized);
+        }
+        if let Err(err) = std::fs::rename(&staging_dir, &pilot_dir) {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(PilotKeyStoreError::Io(err));
+        }
+
+        Ok(identity)
+    }
+
+    pub fn load_pilot(
+        &self,
+        pilot_id: &PilotId,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<Option<PilotIdentity>, PilotKeyStoreError> {
+        let pilot_dir = self.pilot_dir(pilot_id);
+        if !pilot_dir.exists() {
+            return Ok(None);
+        }
+        let identity = PilotKeyStore::open(pilot_dir).load(node_secret_key)?;
+        match identity {
+            Some(identity) if identity.pilot_id() == *pilot_id => Ok(Some(identity)),
+            Some(_) => Err(PilotKeyStoreError::Malformed(
+                "pilot directory does not match encrypted pilot_id",
+            )),
+            None => Err(PilotKeyStoreError::Incomplete(
+                "pilot directory exists without pilot identity",
+            )),
+        }
+    }
+
+    pub fn list_pilots(
+        &self,
+        node_secret_key: &iroh::SecretKey,
+    ) -> Result<Vec<PilotPublicIdentityWithProfile>, PilotKeyStoreError> {
+        self.init()?;
+        let mut pilots = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| PilotKeyStoreError::Malformed("pilot key directory must be UTF-8"))?;
+            if name.starts_with('.') || name == ACTIVE_PILOT_AUTH_DIRNAME {
+                continue;
+            }
+            let pilot_id =
+                PilotId::parse(format!("{}{}", PilotId::PREFIX, name)).map_err(|_| {
+                    PilotKeyStoreError::Malformed("pilot directory must be 32-byte lowercase hex")
+                })?;
+            let identity = self
+                .load_pilot(&pilot_id, node_secret_key)?
+                .ok_or(PilotKeyStoreError::MissingPilotIdentity)?;
+            let profile = read_profile(&profile_path(&entry.path()))?;
+            let public = identity.export_public_identity();
+            pilots.push(PilotPublicIdentityWithProfile {
+                pilot_id: public.pilot_id,
+                pilot_id_public_key_hex: public.pilot_id_public_key_hex,
+                active_pilot_auth_public_key_hex: public.active_pilot_auth_public_key_hex,
+                display_name: profile.display_name,
+                country: profile.country,
+            });
+        }
+        pilots.sort_by(|left, right| left.pilot_id.as_str().cmp(right.pilot_id.as_str()));
+        Ok(pilots)
+    }
+
+    pub fn pilot_store(&self, pilot_id: &PilotId) -> PilotKeyStore {
+        PilotKeyStore::open(self.pilot_dir(pilot_id))
+    }
+
+    pub fn load_profile(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Option<PilotProfile>, PilotKeyStoreError> {
+        let path = profile_path(&self.pilot_dir(pilot_id));
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_profile(&path)?))
+    }
+
+    fn pilot_dir(&self, pilot_id: &PilotId) -> PathBuf {
+        self.root.join(pilot_id.public_key_hex())
+    }
+
+    fn fresh_staging_dir(&self) -> PathBuf {
+        loop {
+            let path = self.root.join(format!(
+                ".new-pilot-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            if !path.exists() {
+                return path;
+            }
+        }
+    }
+}
+
+fn validate_profile(profile: &PilotProfile) -> Result<(), PilotKeyStoreError> {
+    if profile.display_name.trim().is_empty() {
+        return Err(PilotKeyStoreError::Malformed(
+            "pilot display_name must not be empty",
+        ));
+    }
+    if let Some(country) = &profile.country {
+        if !country.is_empty()
+            && !(country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()))
+        {
+            return Err(PilotKeyStoreError::Malformed(
+                "pilot country must be ISO 3166-1 alpha-2 uppercase",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn profile_path(root: &Path) -> PathBuf {
+    root.join(PILOT_PROFILE_FILENAME)
+}
+
+fn write_profile(path: &Path, profile: &PilotProfile) -> Result<(), PilotKeyStoreError> {
+    validate_profile(profile)?;
+    write_json_file_atomic(path, profile)
+}
+
+fn read_profile(path: &Path) -> Result<PilotProfile, PilotKeyStoreError> {
+    if !path.exists() {
+        return Err(PilotKeyStoreError::Incomplete("pilot profile is missing"));
+    }
+    ensure_file_permissions(path)?;
+    let profile: PilotProfile = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_profile(&profile)?;
+    Ok(profile)
+}
+
+// ── PilotCredentialStore ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PilotCredentialStore {
+    root: PathBuf,
+}
+
+impl PilotCredentialStore {
+    pub fn open(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
+        Self::open(data_dir.as_ref().join(PILOT_CREDENTIALS_DIRNAME))
+    }
+
+    pub fn init(&self) -> Result<(), PilotKeyStoreError> {
+        ensure_dir(&self.root)
+    }
+
+    pub fn set_credential(
+        &self,
+        pilot_id: &PilotId,
+        access_pin: &str,
+    ) -> Result<(), PilotKeyStoreError> {
+        if access_pin.is_empty() {
+            return Err(PilotKeyStoreError::Malformed(
+                "pilot access_pin must not be empty",
+            ));
+        }
+        self.init()?;
+        ensure_dir(&self.pilot_dir(pilot_id))?;
+        let file = PilotCredentialFile {
+            argon2id_hash: hash_access_pin(access_pin)?,
+            created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        };
+        write_json_file_atomic(&self.credential_path(pilot_id), &file)
+    }
+
+    pub fn verify_credential(
+        &self,
+        pilot_id: &PilotId,
+        access_pin: &str,
+    ) -> Result<bool, PilotKeyStoreError> {
+        if access_pin.is_empty() {
+            return Ok(false);
+        }
+        let path = self.credential_path(pilot_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        ensure_file_permissions(&path)?;
+        let file: PilotCredentialFile = serde_json::from_slice(&std::fs::read(path)?)?;
+        let parsed = PasswordHash::new(&file.argon2id_hash)
+            .map_err(|_| PilotKeyStoreError::MalformedCredential)?;
+        match argon2id().verify_password(access_pin.as_bytes(), &parsed) {
+            Ok(()) => Ok(true),
+            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(_) => Err(PilotKeyStoreError::MalformedCredential),
+        }
+    }
+
+    fn pilot_dir(&self, pilot_id: &PilotId) -> PathBuf {
+        self.root.join(pilot_id.public_key_hex())
+    }
+
+    fn credential_path(&self, pilot_id: &PilotId) -> PathBuf {
+        self.pilot_dir(pilot_id).join(PILOT_CREDENTIAL_FILENAME)
+    }
+}
+
+fn hash_access_pin(access_pin: &str) -> Result<String, PilotKeyStoreError> {
+    let mut salt_bytes = [0u8; 16];
+    rand::fill(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|err| PilotKeyStoreError::CredentialHash(err.to_string()))?;
+    let hash = argon2id()
+        .hash_password(access_pin.as_bytes(), &salt)
+        .map_err(|err| PilotKeyStoreError::CredentialHash(err.to_string()))?;
+    Ok(hash.to_string())
+}
+
+fn argon2id() -> Argon2<'static> {
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default())
+}
+
+// ── PilotKeyStore ────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct PilotKeyStore {
     root: PathBuf,
@@ -139,10 +451,6 @@ pub struct PilotKeyStore {
 impl PilotKeyStore {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
-    }
-
-    pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
-        Self::open(data_dir.as_ref().join(PILOT_KEYS_DIRNAME))
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -246,16 +554,6 @@ impl PilotKeyStore {
             pilot_id_root,
             active_pilot_auth,
         })
-    }
-
-    pub fn load_or_generate(
-        &self,
-        node_secret_key: &iroh::SecretKey,
-    ) -> Result<PilotIdentity, PilotKeyStoreError> {
-        match self.load(node_secret_key)? {
-            Some(identity) => Ok(identity),
-            None => self.generate(node_secret_key),
-        }
     }
 
     pub fn export_public_identity(
@@ -674,7 +972,7 @@ fn aad_for_role(role: &str) -> String {
     format!("{KEY_FILE_SCHEMA}:v{KEY_FILE_VERSION}:{role}")
 }
 
-fn write_json_file_atomic(path: &Path, value: &EncryptedKeyFile) -> Result<(), PilotKeyStoreError> {
+fn write_json_file_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), PilotKeyStoreError> {
     write_json_file_atomic_impl(
         path,
         value,
@@ -811,7 +1109,7 @@ mod tests {
 
     fn temp_store() -> (PilotKeyStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = PilotKeyStore::for_data_dir(dir.path());
+        let store = PilotKeyStore::open(dir.path().join("pilot"));
         store.init().unwrap();
         (store, dir)
     }
@@ -840,7 +1138,7 @@ mod tests {
         let (store, _dir) = temp_store();
         let node_secret_key = deterministic_secret_key(7);
 
-        let generated = store.load_or_generate(&node_secret_key).unwrap();
+        let generated = store.generate(&node_secret_key).unwrap();
         let loaded = store.load(&node_secret_key).unwrap().unwrap();
 
         assert_eq!(generated.pilot_id(), loaded.pilot_id());
@@ -979,7 +1277,7 @@ mod tests {
     fn archived_pilot_auth_dids_lists_retired_identifiers_only() {
         let (store, _dir) = temp_store();
         let node_secret_key = deterministic_secret_key(51);
-        let identity = store.load_or_generate(&node_secret_key).unwrap();
+        let identity = store.generate(&node_secret_key).unwrap();
         let next = store
             .generate_next_active_pilot_auth_secret_key(&node_secret_key)
             .unwrap();
@@ -992,6 +1290,188 @@ mod tests {
 
         assert_eq!(archived, vec![retired]);
         assert_ne!(archived[0], rotated.active_pilot_auth_did());
+    }
+
+    // ── MultiPilotKeyStore ───────────────────────────────────────────────────
+
+    fn temp_multi_pilot_store() -> (MultiPilotKeyStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MultiPilotKeyStore::for_data_dir(dir.path());
+        store.init().unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn multi_pilot_generate_load_and_list_round_trip() {
+        let (store, _dir) = temp_multi_pilot_store();
+        let node_secret_key = deterministic_secret_key(81);
+
+        let alice = store
+            .generate_pilot("Alice", Some("NO".to_string()), &node_secret_key)
+            .unwrap();
+        let bob = store.generate_pilot("Bob", None, &node_secret_key).unwrap();
+
+        assert_ne!(alice.pilot_id(), bob.pilot_id());
+        assert_eq!(
+            store
+                .load_pilot(&alice.pilot_id(), &node_secret_key)
+                .unwrap()
+                .unwrap()
+                .pilot_id(),
+            alice.pilot_id()
+        );
+        assert_eq!(
+            store
+                .load_pilot(&bob.pilot_id(), &node_secret_key)
+                .unwrap()
+                .unwrap()
+                .pilot_id(),
+            bob.pilot_id()
+        );
+
+        let pilots = store.list_pilots(&node_secret_key).unwrap();
+        assert_eq!(pilots.len(), 2);
+        assert!(pilots.iter().any(|pilot| {
+            pilot.pilot_id == alice.pilot_id()
+                && pilot.display_name == "Alice"
+                && pilot.country.as_deref() == Some("NO")
+        }));
+        assert!(pilots.iter().any(|pilot| {
+            pilot.pilot_id == bob.pilot_id()
+                && pilot.display_name == "Bob"
+                && pilot.country.is_none()
+        }));
+    }
+
+    #[test]
+    fn multi_pilot_load_absent_does_not_create_directory() {
+        let (store, _dir) = temp_multi_pilot_store();
+        let node_secret_key = deterministic_secret_key(82);
+        let absent = pilot_id(182);
+
+        assert!(
+            store
+                .load_pilot(&absent, &node_secret_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.pilot_dir(&absent).exists());
+    }
+
+    #[test]
+    fn multi_pilot_store_returns_per_pilot_key_store_for_rotation() {
+        let (store, _dir) = temp_multi_pilot_store();
+        let node_secret_key = deterministic_secret_key(83);
+        let identity = store
+            .generate_pilot("Carol", Some("SE".to_string()), &node_secret_key)
+            .unwrap();
+        let pilot_store = store.pilot_store(&identity.pilot_id());
+        let next = pilot_store
+            .generate_next_active_pilot_auth_secret_key(&node_secret_key)
+            .unwrap();
+        let retired = identity.active_pilot_auth_did();
+
+        let rotated = pilot_store
+            .replace_active_pilot_auth(&node_secret_key, &next)
+            .unwrap();
+
+        assert_eq!(
+            pilot_store.archived_pilot_auth_dids().unwrap(),
+            vec![retired]
+        );
+        assert_eq!(
+            store
+                .load_pilot(&identity.pilot_id(), &node_secret_key)
+                .unwrap()
+                .unwrap()
+                .active_pilot_auth_did(),
+            rotated.active_pilot_auth_did()
+        );
+    }
+
+    #[test]
+    fn multi_pilot_wrong_node_key_cannot_decrypt() {
+        let (store, _dir) = temp_multi_pilot_store();
+        let identity = store
+            .generate_pilot("Dana", None, &deterministic_secret_key(84))
+            .unwrap();
+
+        assert!(matches!(
+            store.load_pilot(&identity.pilot_id(), &deterministic_secret_key(85)),
+            Err(PilotKeyStoreError::WrongNodeIdentity)
+        ));
+    }
+
+    #[test]
+    fn multi_pilot_rejects_invalid_profile() {
+        let (store, _dir) = temp_multi_pilot_store();
+        let node_secret_key = deterministic_secret_key(86);
+
+        assert!(matches!(
+            store.generate_pilot("", None, &node_secret_key),
+            Err(PilotKeyStoreError::Malformed(_))
+        ));
+        assert!(matches!(
+            store.generate_pilot("Eve", Some("zz".to_string()), &node_secret_key),
+            Err(PilotKeyStoreError::Malformed(_))
+        ));
+    }
+
+    // ── PilotCredentialStore ─────────────────────────────────────────────────
+
+    fn temp_credential_store() -> (PilotCredentialStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PilotCredentialStore::for_data_dir(dir.path());
+        store.init().unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn credential_store_hashes_and_verifies_pin() {
+        let (store, _dir) = temp_credential_store();
+        let pilot = pilot_id(190);
+
+        store.set_credential(&pilot, "1234").unwrap();
+
+        assert!(store.verify_credential(&pilot, "1234").unwrap());
+        assert!(!store.verify_credential(&pilot, "9999").unwrap());
+        assert!(!store.verify_credential(&pilot_id(191), "1234").unwrap());
+    }
+
+    #[test]
+    fn credential_store_does_not_store_plaintext_pin() {
+        let (store, _dir) = temp_credential_store();
+        let pilot = pilot_id(192);
+
+        store.set_credential(&pilot, "1234").unwrap();
+        let bytes = std::fs::read(store.credential_path(&pilot)).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("1234"));
+        assert!(text.contains("$argon2id$"));
+    }
+
+    #[test]
+    fn credential_store_rejects_empty_pin() {
+        let (store, _dir) = temp_credential_store();
+
+        assert!(matches!(
+            store.set_credential(&pilot_id(193), ""),
+            Err(PilotKeyStoreError::Malformed(_))
+        ));
+        assert!(!store.verify_credential(&pilot_id(193), "").unwrap());
+    }
+
+    #[test]
+    fn credential_store_overwrites_existing_pin() {
+        let (store, _dir) = temp_credential_store();
+        let pilot = pilot_id(194);
+
+        store.set_credential(&pilot, "1234").unwrap();
+        store.set_credential(&pilot, "5678").unwrap();
+
+        assert!(!store.verify_credential(&pilot, "1234").unwrap());
+        assert!(store.verify_credential(&pilot, "5678").unwrap());
     }
 
     // ── PrivateAccessKeyStore ─────────────────────────────────────────────────

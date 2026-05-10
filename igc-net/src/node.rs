@@ -26,7 +26,8 @@ use crate::governance::{
 use crate::id::NodeIdHex;
 use crate::id::PilotId;
 use crate::keys::{
-    PilotIdentity, PilotKeyStore, PilotKeyStoreError, PilotKeyStoreStatus, PilotPublicIdentity,
+    MultiPilotKeyStore, PilotCredentialStore, PilotIdentity, PilotKeyStore, PilotKeyStoreError,
+    PilotProfile, PilotPublicIdentityWithProfile,
 };
 use crate::store::{FlatFileStore, StoreError};
 use crate::topic::{announce_topic_id, governance_topic_id, pilot_auth_did_governance_topic_id};
@@ -117,7 +118,8 @@ pub struct IgcIrohNode {
     governance_record_sender: GossipSender,
     node_id: NodeIdHex,
     node_key_bytes: [u8; 32],
-    pilot_keys: PilotKeyStore,
+    multi_pilot_keys: MultiPilotKeyStore,
+    pilot_credentials: PilotCredentialStore,
     governance: GovernanceStore,
 }
 
@@ -261,8 +263,10 @@ impl IgcIrohNode {
             }
         };
         let secret_key = iroh::SecretKey::from_bytes(&key_bytes);
-        let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
-        pilot_keys.init()?;
+        let multi_pilot_keys = MultiPilotKeyStore::for_data_dir(&data_dir);
+        multi_pilot_keys.init()?;
+        let pilot_credentials = PilotCredentialStore::for_data_dir(&data_dir);
+        pilot_credentials.init()?;
         let governance = GovernanceStore::for_data_dir(&data_dir);
         governance.init()?;
 
@@ -476,7 +480,8 @@ impl IgcIrohNode {
             governance_record_sender,
             node_id,
             node_key_bytes: key_bytes,
-            pilot_keys,
+            multi_pilot_keys,
+            pilot_credentials,
             governance,
         })
     }
@@ -614,26 +619,126 @@ impl IgcIrohNode {
         self.store.as_ref()
     }
 
-    /// Inspect the dedicated pilot key store layout and current file presence.
-    pub fn inspect_pilot_key_store(&self) -> Result<PilotKeyStoreStatus, NodeError> {
-        Ok(self.pilot_keys.inspect()?)
-    }
-
-    /// Load existing pilot identity material from the encrypted pilot key store.
-    pub fn load_pilot_identity(&self) -> Result<Option<PilotIdentity>, NodeError> {
-        Ok(self.pilot_keys.load(&self.node_secret_key())?)
-    }
-
-    /// Load existing pilot identity material or generate a fresh initial pair.
-    pub fn load_or_generate_pilot_identity(&self) -> Result<PilotIdentity, NodeError> {
-        Ok(self.pilot_keys.load_or_generate(&self.node_secret_key())?)
-    }
-
-    /// Export only the public pilot identity material in stable machine-readable form.
-    pub fn export_pilot_public_identity(&self) -> Result<Option<PilotPublicIdentity>, NodeError> {
+    /// Generate a new registered pilot identity in the multi-pilot key store.
+    pub fn generate_pilot_identity(
+        &self,
+        display_name: impl Into<String>,
+        country: Option<String>,
+    ) -> Result<PilotIdentity, NodeError> {
         Ok(self
-            .pilot_keys
-            .export_public_identity(&self.node_secret_key())?)
+            .multi_pilot_keys
+            .generate_pilot(display_name, country, &self.node_secret_key())?)
+    }
+
+    /// Register a pilot with a local portal credential and publish its initial auth DID.
+    pub async fn register_pilot_identity(
+        &self,
+        display_name: impl Into<String>,
+        country: Option<String>,
+        access_pin: &str,
+        created_at: impl Into<String>,
+    ) -> Result<PilotIdentity, NodeError> {
+        let identity = self.generate_pilot_identity(display_name, country)?;
+        self.pilot_credentials
+            .set_credential(&identity.pilot_id(), access_pin)?;
+        let record = issue_initial_pilot_auth_did_record(&self.governance, &identity, created_at)?;
+        self.governance.persist_pilot_auth_did_record(&record)?;
+        self.broadcast_pilot_auth_did_update(&record).await?;
+        Ok(identity)
+    }
+
+    /// Load a registered pilot identity by stable `pilot_id`.
+    pub fn load_registered_pilot_identity(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Option<PilotIdentity>, NodeError> {
+        Ok(self
+            .multi_pilot_keys
+            .load_pilot(pilot_id, &self.node_secret_key())?)
+    }
+
+    /// List registered pilots without exposing private key material.
+    pub fn list_registered_pilots(&self) -> Result<Vec<PilotPublicIdentityWithProfile>, NodeError> {
+        Ok(self.multi_pilot_keys.list_pilots(&self.node_secret_key())?)
+    }
+
+    /// Load registered pilot profile metadata.
+    pub fn load_registered_pilot_profile(
+        &self,
+        pilot_id: &PilotId,
+    ) -> Result<Option<PilotProfile>, NodeError> {
+        Ok(self.multi_pilot_keys.load_profile(pilot_id)?)
+    }
+
+    /// Verify a registered pilot's local portal credential.
+    pub fn verify_pilot_credential(
+        &self,
+        pilot_id: &PilotId,
+        access_pin: &str,
+    ) -> Result<bool, NodeError> {
+        Ok(self
+            .pilot_credentials
+            .verify_credential(pilot_id, access_pin)?)
+    }
+
+    /// Return the per-pilot store used for pilot-auth-DID rotation.
+    pub fn registered_pilot_store(&self, pilot_id: &PilotId) -> PilotKeyStore {
+        self.multi_pilot_keys.pilot_store(pilot_id)
+    }
+
+    /// Create and persist the initial pilot-auth-did-record for a registered pilot.
+    pub async fn issue_initial_registered_pilot_auth_did_record(
+        &self,
+        pilot_id: &PilotId,
+        created_at: impl Into<String>,
+    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
+        let identity = self
+            .load_registered_pilot_identity(pilot_id)?
+            .ok_or(PilotKeyStoreError::MissingPilotIdentity)?;
+        let record = issue_initial_pilot_auth_did_record(&self.governance, &identity, created_at)?;
+        self.governance.persist_pilot_auth_did_record(&record)?;
+        self.broadcast_pilot_auth_did_update(&record).await?;
+        Ok(record)
+    }
+
+    /// Rotate the active pilot_auth_did key for a registered pilot.
+    pub async fn rotate_registered_pilot_auth_did(
+        &self,
+        pilot_id: &PilotId,
+        created_at: impl Into<String>,
+    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
+        let current_identity = self
+            .load_registered_pilot_identity(pilot_id)?
+            .ok_or(PilotKeyStoreError::MissingPilotIdentity)?;
+        let pilot_store = self.registered_pilot_store(pilot_id);
+        let next_active_pilot_auth_secret_key =
+            pilot_store.generate_next_active_pilot_auth_secret_key(&self.node_secret_key())?;
+        let record = rotate_pilot_auth_did_record(
+            &self.governance,
+            &current_identity,
+            &next_active_pilot_auth_secret_key,
+            created_at,
+        )?;
+        pilot_store.replace_active_pilot_auth(
+            &self.node_secret_key(),
+            &next_active_pilot_auth_secret_key,
+        )?;
+        if let Err(persist_err) = self.governance.persist_pilot_auth_did_record(&record) {
+            match pilot_store.replace_active_pilot_auth(
+                &self.node_secret_key(),
+                &current_identity.active_pilot_auth_secret_key(),
+            ) {
+                Ok(_) => return Err(NodeError::PilotAuthDidRotationPersistFailed(persist_err)),
+                Err(rollback_err) => {
+                    return Err(NodeError::PilotAuthDidRotationPersistRollback {
+                        persist: persist_err,
+                        rollback: rollback_err,
+                    });
+                }
+            }
+        }
+        self.broadcast_pilot_auth_did_update(&record).await?;
+        Ok(record)
     }
 
     /// Access the governance store that persists identity governance records.
@@ -695,57 +800,6 @@ impl IgcIrohNode {
             .request_pilot_auth_did_sync_from_peer(peer, &request)
             .await?;
         self.apply_pilot_auth_did_sync(&response)
-    }
-
-    /// Create and persist the initial pilot-auth-did-record for this node's pilot identity.
-    pub async fn issue_initial_pilot_auth_did_record(
-        &self,
-        created_at: impl Into<String>,
-    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
-        let identity = self.load_or_generate_pilot_identity()?;
-        let record = issue_initial_pilot_auth_did_record(&self.governance, &identity, created_at)?;
-        self.governance.persist_pilot_auth_did_record(&record)?;
-        self.broadcast_pilot_auth_did_update(&record).await?;
-        Ok(record)
-    }
-
-    /// Rotate the active pilot_auth_did key, archive the previous key, and persist the new governance record.
-    pub async fn rotate_pilot_auth_did(
-        &self,
-        created_at: impl Into<String>,
-    ) -> Result<crate::PilotAuthDidRecord, NodeError> {
-        let current_identity = self
-            .load_pilot_identity()?
-            .ok_or(PilotKeyStoreError::MissingPilotIdentity)?;
-        let next_active_pilot_auth_secret_key = self
-            .pilot_keys
-            .generate_next_active_pilot_auth_secret_key(&self.node_secret_key())?;
-        let record = rotate_pilot_auth_did_record(
-            &self.governance,
-            &current_identity,
-            &next_active_pilot_auth_secret_key,
-            created_at,
-        )?;
-        self.pilot_keys.replace_active_pilot_auth(
-            &self.node_secret_key(),
-            &next_active_pilot_auth_secret_key,
-        )?;
-        if let Err(persist_err) = self.governance.persist_pilot_auth_did_record(&record) {
-            match self.pilot_keys.replace_active_pilot_auth(
-                &self.node_secret_key(),
-                &current_identity.active_pilot_auth_secret_key(),
-            ) {
-                Ok(_) => return Err(NodeError::PilotAuthDidRotationPersistFailed(persist_err)),
-                Err(rollback_err) => {
-                    return Err(NodeError::PilotAuthDidRotationPersistRollback {
-                        persist: persist_err,
-                        rollback: rollback_err,
-                    });
-                }
-            }
-        }
-        self.broadcast_pilot_auth_did_update(&record).await?;
-        Ok(record)
     }
 
     /// Resolve a local read-only filesystem path for a BLAKE3-keyed blob.

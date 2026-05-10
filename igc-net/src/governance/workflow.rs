@@ -151,10 +151,10 @@ mod tests {
         iroh::SecretKey,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let key_store = PilotKeyStore::for_data_dir(dir.path());
+        let key_store = PilotKeyStore::open(dir.path().join("pilot"));
         key_store.init().unwrap();
         let node_secret = deterministic_secret_key(byte);
-        let identity = key_store.load_or_generate(&node_secret).unwrap();
+        let identity = key_store.generate(&node_secret).unwrap();
         (key_store, identity, dir, node_secret)
     }
 
