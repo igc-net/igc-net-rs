@@ -3,14 +3,14 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{SAMPLE_IGC, wait_for_artifact_registry_record, wait_for_index_record};
+use common::{SAMPLE_IGC, wait_for_artifact_registry_record};
 use igc_net::{
     FetchPolicy, IgcIrohNode, IndexerConfig, PublicationMode, publish, publish_private,
     publish_protected, run_indexer, sanitize_protected_igc,
 };
 
-/// Node A publishes; Node B (Eager indexer) fetches both the metadata and the
-/// raw IGC blob and verifies content integrity.
+/// Node A publishes; Node B (Eager indexer) fetches the public raw IGC blob and
+/// verifies content integrity.
 #[tokio::test]
 async fn eager_indexer_fetches_raw_igc_blob() {
     let dir_a = tempfile::tempdir().unwrap();
@@ -40,14 +40,15 @@ async fn eager_indexer_fetches_raw_igc_blob() {
         .unwrap();
 
     assert!(
-        wait_for_index_record(node_b.store(), &result.igc_hash, Duration::from_secs(30)).await,
+        wait_for_artifact_registry_record(
+            node_b.store(),
+            &result.igc_hash,
+            Duration::from_secs(30)
+        )
+        .await,
         "Node B did not receive the announcement within the timeout"
     );
 
-    assert!(
-        node_b.store().contains(&result.meta_hash).unwrap(),
-        "metadata blob must be present after Eager indexing"
-    );
     assert!(
         node_b.store().contains(&result.igc_hash).unwrap(),
         "raw IGC blob must be present after Eager indexing"

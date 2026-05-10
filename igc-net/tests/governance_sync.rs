@@ -16,9 +16,12 @@ async fn pilot_auth_did_sync_round_trips_over_network() {
 
     node_b.add_peer_addr(node_a.loopback_endpoint_addr().unwrap());
 
-    let pilot_id = node_a.load_or_generate_pilot_identity().unwrap().pilot_id();
+    let pilot_id = node_a
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap()
+        .pilot_id();
     let initial = node_a
-        .issue_initial_pilot_auth_did_record("2026-05-01T09:14:00Z")
+        .issue_initial_registered_pilot_auth_did_record(&pilot_id, "2026-05-01T09:14:00Z")
         .await
         .unwrap();
 
@@ -34,7 +37,7 @@ async fn pilot_auth_did_sync_round_trips_over_network() {
     );
 
     let rotated = node_a
-        .rotate_pilot_auth_did("2026-05-01T10:14:00Z")
+        .rotate_registered_pilot_auth_did(&pilot_id, "2026-05-01T10:14:00Z")
         .await
         .unwrap();
 
@@ -86,9 +89,12 @@ async fn pilot_auth_did_gossip_propagates_updates_across_peers() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let pilot_id = node_a.load_or_generate_pilot_identity().unwrap().pilot_id();
+    let pilot_id = node_a
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap()
+        .pilot_id();
     let initial = node_a
-        .issue_initial_pilot_auth_did_record("2026-05-01T09:14:00Z")
+        .issue_initial_registered_pilot_auth_did_record(&pilot_id, "2026-05-01T09:14:00Z")
         .await
         .unwrap();
 
@@ -112,7 +118,7 @@ async fn pilot_auth_did_gossip_propagates_updates_across_peers() {
     );
 
     let rotated = node_a
-        .rotate_pilot_auth_did("2026-05-01T10:14:00Z")
+        .rotate_registered_pilot_auth_did(&pilot_id, "2026-05-01T10:14:00Z")
         .await
         .unwrap();
 
@@ -157,9 +163,12 @@ async fn governance_topic_gossip_applies_full_pilot_auth_records() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let pilot_id = node_a.load_or_generate_pilot_identity().unwrap().pilot_id();
+    let pilot_id = node_a
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap()
+        .pilot_id();
     let initial = node_a
-        .issue_initial_pilot_auth_did_record("2026-05-01T09:14:00Z")
+        .issue_initial_registered_pilot_auth_did_record(&pilot_id, "2026-05-01T09:14:00Z")
         .await
         .unwrap();
 

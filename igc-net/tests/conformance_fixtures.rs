@@ -376,6 +376,7 @@ async fn transport_fixture_tombstone_updates_event_cursor_and_local_availability
         has_protected_sanitized_igc: false,
         has_protected_raw_companion: false,
         serving_node_ids: vec![serving_node],
+        g_record_present: None,
         recorded_at: "2026-05-01T09:14:00Z".to_string(),
     };
     let tombstone = ArtifactRegistryRecord {

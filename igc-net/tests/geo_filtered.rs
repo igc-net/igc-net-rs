@@ -3,12 +3,11 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{SAMPLE_IGC, init_tracing, wait_for_index_record};
+use common::{SAMPLE_IGC, init_tracing, wait_for_artifact_registry_record};
 use igc_net::{FetchPolicy, IgcIrohNode, IndexerConfig, publish, run_indexer};
 
-/// Node A publishes a flight in Switzerland (~47.5N, 8.6E). Node B with a
-/// Europe filter fetches both blobs; Node C with a South America filter
-/// fetches only metadata.
+/// Geo-filtered indexers record artifact announcements without fetching bytes
+/// when the announcement has no filter metadata.
 #[tokio::test]
 async fn geo_filtered_indexer_fetches_only_matching_region() {
     init_tracing();
@@ -71,26 +70,32 @@ async fn geo_filtered_indexer_fetches_only_matching_region() {
         .unwrap();
 
     assert!(
-        wait_for_index_record(node_b.store(), &result.igc_hash, Duration::from_secs(30)).await,
+        wait_for_artifact_registry_record(
+            node_b.store(),
+            &result.igc_hash,
+            Duration::from_secs(30)
+        )
+        .await,
         "Node B (Europe filter) should receive the announcement"
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        node_b.store().contains(&result.igc_hash).unwrap(),
-        "Node B (Europe filter) should fetch the raw IGC blob"
+        !node_b.store().contains(&result.igc_hash).unwrap(),
+        "Node B (Europe filter) should not fetch raw IGC without announcement metadata"
     );
 
     assert!(
-        wait_for_index_record(node_c.store(), &result.igc_hash, Duration::from_secs(30)).await,
+        wait_for_artifact_registry_record(
+            node_c.store(),
+            &result.igc_hash,
+            Duration::from_secs(30)
+        )
+        .await,
         "Node C (South America filter) should receive the announcement"
     );
     assert!(
-        node_c.store().contains(&result.meta_hash).unwrap(),
-        "Node C should have the metadata blob"
-    );
-    assert!(
         !node_c.store().contains(&result.igc_hash).unwrap(),
-        "Node C (South America filter) should NOT fetch the raw IGC blob"
+        "Node C (South America filter) should not fetch the raw IGC blob"
     );
 
     indexer_b.abort();

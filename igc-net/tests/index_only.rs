@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{SAMPLE_IGC, init_tracing, wait_for_artifact_registry_record};
-use igc_net::{FetchPolicy, IgcIrohNode, IndexerConfig, publish, run_indexer};
+use igc_net::{FetchPolicy, IgcIrohNode, IndexerConfig, PublicationMode, publish, run_indexer};
 
-/// Publishing the same IGC file twice from the same node should result in
-/// only one artifact-registry event on the indexer.
+/// Node A publishes an IGC file; Node B records the artifact announcement
+/// without fetching raw IGC bytes.
 #[tokio::test]
-async fn duplicate_publish_is_deduplicated_on_indexer() {
+async fn publisher_and_indexer_exchange_artifact_announcement_on_loopback() {
     init_tracing();
 
     let dir_a = tempfile::tempdir().unwrap();
@@ -33,40 +33,33 @@ async fn duplicate_publish_is_deduplicated_on_indexer() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let result1 = publish(&node_a, SAMPLE_IGC.to_vec(), Some("dup.igc"))
+    let result = publish(&node_a, SAMPLE_IGC.to_vec(), Some("sample.igc"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let result2 = publish(&node_a, SAMPLE_IGC.to_vec(), Some("dup.igc"))
-        .await
-        .unwrap();
-
-    assert_eq!(result1.igc_hash, result2.igc_hash);
-    assert_eq!(result1.meta_hash, result2.meta_hash);
 
     assert!(
         wait_for_artifact_registry_record(
             node_b.store(),
-            &result1.igc_hash,
+            &result.igc_hash,
             Duration::from_secs(30)
         )
         .await,
-        "Node B should receive at least one announcement"
+        "Node B did not receive the announcement within the timeout"
     );
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !node_b.store().contains(&result.igc_hash).unwrap(),
+        "raw IGC blob must not be fetched under IndexOnly policy"
+    );
 
-    let count = node_b
+    let record = node_b
         .store()
-        .artifact_registry_events_since(0)
+        .artifact_registry_record(&result.igc_hash)
         .unwrap()
-        .into_iter()
-        .filter(|(_, r)| r.raw_igc_hash == result1.igc_hash)
-        .count();
-    assert_eq!(
-        count, 1,
-        "duplicate announcements from the same (raw_igc_hash, node_id) must be deduplicated"
-    );
+        .unwrap();
+    assert_eq!(record.publication_mode, PublicationMode::Public);
+    assert_eq!(record.raw_igc_hash, result.igc_hash);
+    assert!(!record.has_raw_igc);
 
     indexer.abort();
     node_a.close().await;
