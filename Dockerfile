@@ -3,7 +3,7 @@ FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /workspace
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config ca-certificates \
+    && apt-get install -y --no-install-recommends pkg-config ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 COPY specs ./specs

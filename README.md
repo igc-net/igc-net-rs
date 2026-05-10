@@ -11,21 +11,32 @@ Public package identities:
 
 ## Status
 
-Implemented:
+Implemented (v0.3):
 
-- base publish/index/fetch protocol
-- base metadata schema (`igc-net/metadata`, `schema_version = 1`)
-- metadata validation for canonical timestamps, dates, bbox bounds, and
-  coordinate ranges
-- flat-file blob store and append-only source index
-- typed identifier and typed error surfaces in the public library API
-- loopback integration tests for metadata-only indexing, eager fetch,
-  multi-publisher re-announcement, geo-filtered fetch, and deduplication
-- crates.io publication for both `igc-net` and `igc-net-cli`
+- Base publish/index/fetch protocol and metadata schema (`igc-net/metadata`, `schema_version = 1`)
+- Metadata validation for canonical timestamps, dates, bbox bounds, and coordinate ranges
+- Flat-file blob store and append-only source index
+- Private-access key custody (`PrivateAccessKeyStore`), restricted-fetch proof
+  signing/verification (`FetchProof`, `GroupFetchProof`)
+- Governance: owner-claim, approval, challenge, resolution, deletion-request,
+  publication-mode, `pilot_auth_did`, private-access rotation records
+- Pilot identity keys and PIN credentials (`PilotKeyStore`, `PilotProfileCredential`
+  VC-JWT issuance and verification)
+- Groups: `GroupStore`, creation records, personal member add/remove, public
+  group invite/accept/leave; group-based restricted-fetch access checks
+- Follow: `FollowStore`, follow/unfollow records
+- Indexer with `index-only`, `eager`, and `geo:<bbox>` fetch policies
+- gRPC sidecar (`igc-net-grpc`) — all 28 RPCs in `igc_net_v0.proto`, including
+  group and follow RPCs via pre-signed `signed_record_json`
+- Loopback integration tests for indexing, fetch, multi-publisher,
+  geo-filtered, and deduplication scenarios
 
 Not yet implemented:
 
 - Part II analytics / `IGC_META_DOC`
+- Portal-convenience group RPCs (`Portal*`) that accept `(pilot_id, access_pin)`
+  and sign records internally — required by `cs-archive` group UI (Phase 0 in
+  `cs-archive/PLAN.md`)
 
 ## Repository Boundary
 
@@ -40,8 +51,9 @@ as the reference implementation for the currently implemented subset.
 ```text
 igc-net-rs/
 ├── docs/
-├── igc-net/
-└── igc-net-cli/
+├── igc-net/          # library crate
+├── igc-net-cli/      # CLI binary
+└── igc-net-grpc/     # gRPC sidecar binary
 ```
 
 ## Compatibility Policy
@@ -80,7 +92,7 @@ Add the library to your Rust project:
 
 ```toml
 [dependencies]
-igc-net = "0.1"
+igc-net = "0.3"
 ```
 
 ## Notes
