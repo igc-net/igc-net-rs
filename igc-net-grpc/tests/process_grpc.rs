@@ -5,8 +5,9 @@ use std::time::Duration;
 use igc_net_grpc::proto::igc_net_client::IgcNetClient;
 use igc_net_grpc::proto::{
     ArtifactClass as ProtoArtifactClass, EventKind, FetchArtifactRequest, GetNodeStatusRequest,
-    ProvisionPrivateAccessKeyRequest, PublicationMode, PublishFlightRequest, QueryIndexRequest,
-    RevokePrivateAccessRequest, SubscribeEventsRequest,
+    IssuePortalAuthTokenRequest, ListPilotsRequest, ProvisionPrivateAccessKeyRequest,
+    PublicationMode, PublishFlightRequest, PublishFlightResponse, PublishedArtifact,
+    QueryIndexRequest, RegisterPilotRequest, RevokePrivateAccessRequest, SubscribeEventsRequest,
 };
 use std::path::Path;
 use std::process::{Child, Command};
@@ -15,6 +16,17 @@ use tokio::time::sleep;
 
 fn secret_key(byte: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[byte; 32])
+}
+
+fn published_response_artifact(
+    response: &PublishFlightResponse,
+    artifact_class: ProtoArtifactClass,
+) -> &PublishedArtifact {
+    response
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_class == artifact_class as i32)
+        .unwrap()
 }
 
 fn free_loopback_addr() -> String {
@@ -115,6 +127,7 @@ async fn seed_private_artifact_with_baseline(
             has_protected_sanitized_igc: false,
             has_protected_raw_companion: false,
             serving_node_ids: vec![node.node_id().clone()],
+            g_record_present: Some(false),
             recorded_at: "2026-05-01T09:14:00Z".to_string(),
         })
         .await
@@ -153,6 +166,7 @@ async fn process_grpc_public_publish_index_and_events() {
             raw_igc: b"HFDTE020714\r\nB1300004730000N00837000EA0030003000\r\n".to_vec(),
             filename: "flight.igc".to_string(),
             publication_mode: PublicationMode::Public as i32,
+            pilot_id: String::new(),
         })
         .await
         .unwrap()
@@ -190,6 +204,80 @@ async fn process_grpc_public_publish_index_and_events() {
 }
 
 #[tokio::test]
+async fn process_grpc_register_list_and_issue_portal_auth_token() {
+    let _guard = process_test_lock().lock().await;
+    let data_dir = tempfile::tempdir().unwrap();
+    let process = GrpcProcess::start(data_dir.path());
+    let mut client = process.client().await;
+
+    let registered = client
+        .register_pilot(RegisterPilotRequest {
+            display_name: "Alice".to_string(),
+            access_pin: "1234".to_string(),
+            country: "NO".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(registered.pilot_id.starts_with("igcnet:id:"));
+    assert!(registered.pilot_auth_did.starts_with("did:key:"));
+    assert_eq!(registered.display_name, "Alice");
+
+    let listed = client
+        .list_pilots(ListPilotsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.pilots.len(), 1);
+    assert_eq!(listed.pilots[0].pilot_id, registered.pilot_id);
+    assert_eq!(listed.pilots[0].display_name, "Alice");
+    assert_eq!(listed.pilots[0].country, "NO");
+
+    let token = client
+        .issue_portal_auth_token(IssuePortalAuthTokenRequest {
+            pilot_id: registered.pilot_id.clone(),
+            portal_id: "cs-archive-local".to_string(),
+            jti: "process-test-jti".to_string(),
+            access_pin: "1234".to_string(),
+            expires_in_seconds: 60,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let jwt = igc_net::PilotProfileCredentialJwt::parse(&token.pilot_profile_vc_jwt).unwrap();
+    jwt.verify_signature().unwrap();
+    assert_eq!(jwt.claims().sub.to_string(), registered.pilot_id);
+    assert!(matches!(
+        jwt.claims().aud.as_ref(),
+        Some(igc_net::JwtAudience::One(audience)) if audience == "cs-archive-local"
+    ));
+    assert_eq!(jwt.claims().jti, "process-test-jti");
+    assert_eq!(
+        jwt.claims().vc.credential_subject.name.as_deref(),
+        Some("Alice")
+    );
+    assert_eq!(
+        jwt.claims().vc.credential_subject.country.as_deref(),
+        Some("NO")
+    );
+
+    let bad_pin = client
+        .issue_portal_auth_token(IssuePortalAuthTokenRequest {
+            pilot_id: registered.pilot_id,
+            portal_id: "cs-archive-local".to_string(),
+            jti: "process-test-bad-pin".to_string(),
+            access_pin: "9999".to_string(),
+            expires_in_seconds: 60,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(bad_pin.code(), tonic::Code::Unauthenticated);
+
+    process.stop();
+}
+
+#[tokio::test]
 async fn process_grpc_public_fetch_pagination_events_and_restart_persist() {
     let _guard = process_test_lock().lock().await;
     let data_dir = tempfile::tempdir().unwrap();
@@ -214,6 +302,7 @@ async fn process_grpc_public_fetch_pagination_events_and_restart_persist() {
                 raw_igc: raw_first.to_vec(),
                 filename: "first.igc".to_string(),
                 publication_mode: PublicationMode::Public as i32,
+                pilot_id: String::new(),
             })
             .await
             .unwrap()
@@ -223,6 +312,7 @@ async fn process_grpc_public_fetch_pagination_events_and_restart_persist() {
                 raw_igc: raw_second.to_vec(),
                 filename: "second.igc".to_string(),
                 publication_mode: PublicationMode::Public as i32,
+                pilot_id: String::new(),
             })
             .await
             .unwrap()
@@ -237,6 +327,7 @@ async fn process_grpc_public_fetch_pagination_events_and_restart_persist() {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             })
             .await
             .unwrap()
@@ -334,6 +425,7 @@ async fn process_grpc_public_fetch_pagination_events_and_restart_persist() {
             requester_key: String::new(),
             seq_num: 0,
             signature: Vec::new(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap()
@@ -352,6 +444,15 @@ async fn process_grpc_protected_publish_serves_only_sanitized_without_auth() {
         b"HFPLTPILOT:Alice\r\nHFCIDCOMPETITION:ABC\r\nB1300004730000N00837000EA0030003000\r\n";
     let sanitized = b"HFPLT:REDACTED\r\nHFCID:REDACTED\r\nB1300004730000N00837000EA0030003000\r\n";
 
+    let seed_node = igc_net::IgcIrohNode::start(data_dir.path()).await.unwrap();
+    let pilot_id = seed_node
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap()
+        .pilot_id();
+    seed_node.close().await;
+    drop(seed_node);
+    sleep(Duration::from_millis(250)).await;
+
     let process = GrpcProcess::start(data_dir.path());
     let mut client = process.client().await;
 
@@ -360,14 +461,21 @@ async fn process_grpc_protected_publish_serves_only_sanitized_without_auth() {
             raw_igc: raw_igc.to_vec(),
             filename: "protected.igc".to_string(),
             publication_mode: PublicationMode::Protected as i32,
+            pilot_id: pilot_id.to_string(),
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(published.raw_igc_hash.len(), 64);
-    assert_eq!(published.protected_hash.len(), 64);
-    assert_eq!(published.tickets.len(), 1);
-    assert_eq!(published.companion_tickets.len(), 1);
+    assert_eq!(published.artifacts.len(), 2);
+    let protected_artifact =
+        published_response_artifact(&published, ProtoArtifactClass::ProtectedSanitizedIgc);
+    let companion_artifact =
+        published_response_artifact(&published, ProtoArtifactClass::ProtectedRawCompanion);
+    assert_eq!(protected_artifact.artifact_hash.len(), 64);
+    assert_eq!(companion_artifact.artifact_hash, published.raw_igc_hash);
+    assert!(!protected_artifact.ticket.is_empty());
+    assert!(!companion_artifact.ticket.is_empty());
 
     let fetched = client
         .fetch_artifact(FetchArtifactRequest {
@@ -376,12 +484,13 @@ async fn process_grpc_protected_publish_serves_only_sanitized_without_auth() {
             requester_key: String::new(),
             seq_num: 0,
             signature: Vec::new(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(fetched.artifact_bytes, sanitized);
-    assert_eq!(fetched.artifact_hash, published.protected_hash);
+    assert_eq!(fetched.artifact_hash, protected_artifact.artifact_hash);
 
     let public_raw = client
         .fetch_artifact(FetchArtifactRequest {
@@ -390,6 +499,7 @@ async fn process_grpc_protected_publish_serves_only_sanitized_without_auth() {
             requester_key: String::new(),
             seq_num: 0,
             signature: Vec::new(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -411,7 +521,9 @@ async fn process_grpc_private_fetch_refuses_stale_governance_and_stale_rotation_
         .unwrap();
     let node_secret_key =
         iroh::SecretKey::from_bytes(&seed_node.store().load_key_bytes().unwrap().unwrap());
-    let identity = seed_node.load_or_generate_pilot_identity().unwrap();
+    let identity = seed_node
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap();
     let pilot_id = identity.pilot_id();
 
     let stale_governance_rotation = igc_net::PrivateAccessRotationRecord::issue(
@@ -456,6 +568,7 @@ async fn process_grpc_private_fetch_refuses_stale_governance_and_stale_rotation_
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -468,7 +581,9 @@ async fn process_grpc_private_fetch_refuses_stale_governance_and_stale_rotation_
         .unwrap();
     let node_secret_key =
         iroh::SecretKey::from_bytes(&seed_node.store().load_key_bytes().unwrap().unwrap());
-    let identity = seed_node.load_or_generate_pilot_identity().unwrap();
+    let identity = seed_node
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap();
     let pilot_id = identity.pilot_id();
     let old_rotation = igc_net::PrivateAccessRotationRecord::issue(
         &identity.pilot_id_secret_key(),
@@ -522,6 +637,7 @@ async fn process_grpc_private_fetch_refuses_stale_governance_and_stale_rotation_
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -552,6 +668,7 @@ async fn process_grpc_private_fetch_uses_seeded_governance_and_provisioned_key()
             has_protected_sanitized_igc: false,
             has_protected_raw_companion: false,
             serving_node_ids: vec![seed_node.node_id().clone()],
+            g_record_present: Some(false),
             recorded_at: "2026-05-01T09:14:00Z".to_string(),
         })
         .await
@@ -610,6 +727,7 @@ async fn process_grpc_private_fetch_uses_seeded_governance_and_provisioned_key()
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap()
@@ -663,6 +781,7 @@ async fn process_grpc_private_fetch_uses_seeded_governance_and_provisioned_key()
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -679,7 +798,9 @@ async fn process_grpc_private_publish_requires_key_and_serves_after_approval() {
     let private_access_key = secret_key(111);
 
     let seed_node = igc_net::IgcIrohNode::start(data_dir.path()).await.unwrap();
-    let identity = seed_node.load_or_generate_pilot_identity().unwrap();
+    let identity = seed_node
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap();
     let pilot_id = identity.pilot_id();
     let rotation = igc_net::PrivateAccessRotationRecord::issue(
         &identity.pilot_id_secret_key(),
@@ -713,14 +834,17 @@ async fn process_grpc_private_publish_requires_key_and_serves_after_approval() {
             raw_igc: raw_igc.to_vec(),
             filename: "private.igc".to_string(),
             publication_mode: PublicationMode::Private as i32,
+            pilot_id: pilot_id.to_string(),
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(published.raw_igc_hash.len(), 64);
-    assert!(published.protected_hash.is_empty());
-    assert_eq!(published.tickets.len(), 1);
-    assert!(published.companion_tickets.is_empty());
+    assert_eq!(published.artifacts.len(), 1);
+    let private_artifact =
+        published_response_artifact(&published, ProtoArtifactClass::PrivateRawIgc);
+    assert_eq!(private_artifact.artifact_hash, published.raw_igc_hash);
+    assert!(!private_artifact.ticket.is_empty());
 
     let proof = igc_net::sign_fetch_proof(
         &published.raw_igc_hash,
@@ -736,6 +860,7 @@ async fn process_grpc_private_publish_requires_key_and_serves_after_approval() {
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -774,6 +899,7 @@ async fn process_grpc_private_publish_requires_key_and_serves_after_approval() {
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap()
@@ -790,7 +916,9 @@ async fn process_grpc_private_fetch_refuses_missing_key_and_blocked_governance()
     let private_access_key = secret_key(121);
 
     let seed_node = igc_net::IgcIrohNode::start(data_dir.path()).await.unwrap();
-    let identity = seed_node.load_or_generate_pilot_identity().unwrap();
+    let identity = seed_node
+        .generate_pilot_identity("Test Pilot", None)
+        .unwrap();
     let pilot_id = identity.pilot_id();
     let rotation = igc_net::PrivateAccessRotationRecord::issue(
         &identity.pilot_id_secret_key(),
@@ -862,6 +990,7 @@ async fn process_grpc_private_fetch_refuses_missing_key_and_blocked_governance()
             requester_key: proof.requester_key,
             seq_num: proof.seq_num,
             signature: hex::decode(proof.signature).unwrap(),
+            group_fetch_proof: None,
         })
         .await
         .unwrap_err();
@@ -891,6 +1020,7 @@ async fn process_grpc_private_fetch_refuses_missing_key_and_blocked_governance()
                 requester_key: proof.requester_key,
                 seq_num: proof.seq_num,
                 signature: hex::decode(proof.signature).unwrap(),
+                group_fetch_proof: None,
             })
             .await
             .unwrap_err();

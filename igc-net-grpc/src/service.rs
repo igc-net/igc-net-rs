@@ -1,8 +1,8 @@
 //! `IgcNet` gRPC service implementation.
 //!
-//! POC scope: PublishFlight (public), FetchArtifact (restricted + public),
-//! QueryIndex, ProvisionPrivateAccessKey, RevokePrivateAccess, GetNodeStatus.
-//! Other RPCs return UNIMPLEMENTED.
+//! POC scope: pilot registration/auth, flight publication, artifact fetch,
+//! index queries, event snapshots, private-access provisioning/revocation, and
+//! node status.
 
 use std::sync::Arc;
 
@@ -13,20 +13,39 @@ use tonic::{Request, Response, Status};
 
 use igc_net::{
     ArtifactClass, ArtifactRegistryRecord, Blake3Hex, FetchProof, FlightGovernanceState,
-    FlightGovernanceStatus, IgcIrohNode, OwnerClaimRecord, PilotId, PrivateAccessKeyStore,
-    PrivateAccessRotationStateStatus, PublicationMode as StorePublicationMode,
-    PublicationModeRecord, SeqNumStore, publish, publish_private, publish_protected,
-    verify_fetch_proof,
+    FlightGovernanceStatus, FollowRecord, FollowStore, GroupCreationRecord, GroupId,
+    GroupMembership, GroupStore, GroupType, IgcIrohNode, OwnerClaimRecord, PrivateGroupMemberAddRecord,
+    PrivateGroupMemberRemoveRecord, PilotId, PilotIdentity, PilotProfileCredentialRequest,
+    PilotProfileCredentialSubjectDraft, PrivateAccessKeyStore, PrivateAccessRotationStateStatus,
+    PublicGroupAcceptRecord, PublicGroupInviteRecord, PublicGroupLeaveRecord,
+    PublicationMode as StorePublicationMode, PublicationModeRecord, SeqNumStore, SystemClock,
+    UnfollowRecord, issue_pilot_profile_credential, publish, publish_private, publish_protected,
+    verify_fetch_proof, verify_group_fetch_proof,
 };
 
 use crate::proto::igc_net_server::IgcNet;
 use crate::proto::{
-    EventKind, FetchArtifactRequest, FetchArtifactResponse, GetNodeStatusRequest,
-    GetNodeStatusResponse, GovernanceServingState, GovernanceSyncState, IgcNetEvent, IndexEntry,
-    ProvisionPrivateAccessKeyRequest, ProvisionPrivateAccessKeyResponse,
-    PublicationMode as ProtoPublicationMode, PublishFlightRequest, PublishFlightResponse,
-    QueryIndexRequest, QueryIndexResponse, RevokePrivateAccessRequest, RevokePrivateAccessResponse,
-    SubscribeEventsRequest,
+    AcceptGroupInvitationRequest, AcceptGroupInvitationResponse, AddPrivateGroupMemberRequest,
+    AddPrivateGroupMemberResponse, ArtifactClass as ProtoArtifactClass, CreateGroupRequest,
+    CreateGroupResponse, EventKind, FetchArtifactRequest, FetchArtifactResponse,
+    FollowPilotRequest, FollowPilotResponse, GetNodeStatusRequest, GetNodeStatusResponse,
+    GetGroupRequest, GetGroupResponse, GetPendingInvitationsRequest,
+    GetPendingInvitationsResponse, GovernanceServingState, GovernanceSyncState, GroupSummary,
+    GroupType as ProtoGroupType, IgcNetEvent, IndexEntry, InviteToPublicGroupRequest,
+    InviteToPublicGroupResponse, IssuePortalAuthTokenRequest, IssuePortalAuthTokenResponse,
+    LeaveGroupRequest, LeaveGroupResponse, ListFollowersRequest, ListFollowersResponse,
+    ListFollowingRequest, ListFollowingResponse, ListGroupMembersRequest,
+    ListGroupMembersResponse, ListMyGroupsRequest, ListMyGroupsResponse,
+    LookupGroupByNameRequest, LookupGroupByNameResponse,
+    ListPilotsRequest, ListPilotsResponse, PilotSummary, PortalAcceptGroupInvitationRequest,
+    PortalAddPrivateGroupMemberRequest, PortalCreateGroupRequest,
+    PortalInviteToPublicGroupRequest, PortalLeaveGroupRequest,
+    PortalRemovePrivateGroupMemberRequest, ProvisionPrivateAccessKeyRequest,
+    ProvisionPrivateAccessKeyResponse, PublicationMode as ProtoPublicationMode,
+    PublishFlightRequest, PublishFlightResponse, PublishedArtifact, QueryIndexRequest,
+    QueryIndexResponse, RegisterPilotRequest, RegisterPilotResponse,
+    RemovePrivateGroupMemberRequest, RemovePrivateGroupMemberResponse, RevokePrivateAccessRequest,
+    RevokePrivateAccessResponse, SubscribeEventsRequest, UnfollowPilotRequest, UnfollowPilotResponse,
 };
 
 // ── Artifact-class constants (proto i32 values) ───────────────────────────────
@@ -36,6 +55,31 @@ const PROTO_CLASS_PROTECTED_SANITIZED_IGC: i32 = 2;
 const PROTO_CLASS_PROTECTED_RAW_COMPANION: i32 = 3;
 const PROTO_CLASS_PRIVATE_RAW_IGC: i32 = 4;
 
+#[derive(Clone, Copy)]
+struct LocalArtifactAvailability {
+    has_raw_igc: bool,
+    has_protected_sanitized_igc: bool,
+    has_protected_raw_companion: bool,
+}
+
+impl LocalArtifactAvailability {
+    fn raw_only() -> Self {
+        Self {
+            has_raw_igc: true,
+            has_protected_sanitized_igc: false,
+            has_protected_raw_companion: false,
+        }
+    }
+
+    fn protected_publish() -> Self {
+        Self {
+            has_raw_igc: true,
+            has_protected_sanitized_igc: true,
+            has_protected_raw_companion: true,
+        }
+    }
+}
+
 // ── NodeContext ───────────────────────────────────────────────────────────────
 
 /// Shared, immutable context threaded through all RPC handlers.
@@ -44,6 +88,9 @@ pub struct NodeContext {
     pub node_secret_key: iroh::SecretKey,
     pub private_access_key_store: PrivateAccessKeyStore,
     pub seq_num_store: SeqNumStore,
+    pub group_store: GroupStore,
+    pub follow_store: FollowStore,
+    pub group_seq_num_store: SeqNumStore,
 }
 
 // ── IgcNetService ─────────────────────────────────────────────────────────────
@@ -56,6 +103,82 @@ pub struct IgcNetService {
 impl IgcNetService {
     pub fn new(ctx: Arc<NodeContext>) -> Self {
         Self { ctx }
+    }
+
+    async fn append_local_artifact_registry_record(
+        &self,
+        raw_igc_hash: Blake3Hex,
+        pilot_id: Option<PilotId>,
+        publication_mode: StorePublicationMode,
+        protected_hash: Option<Blake3Hex>,
+        availability: LocalArtifactAvailability,
+        g_record_present: bool,
+    ) -> Result<(), Status> {
+        self.ctx
+            .node
+            .store()
+            .append_artifact_registry_record(&ArtifactRegistryRecord {
+                raw_igc_hash,
+                pilot_id,
+                publication_mode,
+                protected_hash,
+                has_raw_igc: availability.has_raw_igc,
+                has_protected_sanitized_igc: availability.has_protected_sanitized_igc,
+                has_protected_raw_companion: availability.has_protected_raw_companion,
+                serving_node_ids: vec![self.ctx.node.node_id().clone()],
+                g_record_present: Some(g_record_present),
+                recorded_at: canonical_utc_now(),
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    async fn issue_publish_governance_records(
+        &self,
+        identity: &PilotIdentity,
+        raw_igc_hash: Blake3Hex,
+        publication_mode: StorePublicationMode,
+        protected_hash: Option<Blake3Hex>,
+    ) -> Result<(), Status> {
+        let created_at = canonical_utc_now();
+        let pilot_secret_key = identity.pilot_id_secret_key();
+        let owner_claim = OwnerClaimRecord::issue(
+            &pilot_secret_key,
+            raw_igc_hash.clone(),
+            created_at.clone(),
+            Vec::new(),
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let publication_mode = PublicationModeRecord::issue(
+            &pilot_secret_key,
+            raw_igc_hash,
+            publication_mode,
+            protected_hash,
+            None,
+            created_at,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.ctx
+            .node
+            .governance_store()
+            .persist_owner_claim_record(&owner_claim)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.ctx
+            .node
+            .governance_store()
+            .persist_publication_mode_record(&publication_mode)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.ctx
+            .node
+            .broadcast_governance_record(&owner_claim)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.ctx
+            .node
+            .broadcast_governance_record(&publication_mode)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 }
 
@@ -94,6 +217,127 @@ impl IgcNet for IgcNetService {
         }))
     }
 
+    async fn register_pilot(
+        &self,
+        request: Request<RegisterPilotRequest>,
+    ) -> Result<Response<RegisterPilotResponse>, Status> {
+        let req = request.into_inner();
+        if req.display_name.trim().is_empty() {
+            return Err(Status::invalid_argument("display_name is required"));
+        }
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !req.country.is_empty() && !is_iso_3166_alpha2(&req.country) {
+            return Err(Status::invalid_argument(
+                "country must be ISO 3166-1 alpha-2 uppercase when supplied",
+            ));
+        }
+
+        let identity = self
+            .ctx
+            .node
+            .register_pilot_identity(
+                req.display_name.trim().to_string(),
+                (!req.country.is_empty()).then_some(req.country),
+                &req.access_pin,
+                canonical_utc_now(),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RegisterPilotResponse {
+            pilot_id: identity.pilot_id().to_string(),
+            pilot_auth_did: identity.active_pilot_auth_did().to_string(),
+            display_name: req.display_name.trim().to_string(),
+        }))
+    }
+
+    async fn list_pilots(
+        &self,
+        _request: Request<ListPilotsRequest>,
+    ) -> Result<Response<ListPilotsResponse>, Status> {
+        let pilots = self
+            .ctx
+            .node
+            .list_registered_pilots()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|pilot| PilotSummary {
+                pilot_id: pilot.pilot_id.to_string(),
+                display_name: pilot.display_name,
+                country: pilot.country.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ListPilotsResponse { pilots }))
+    }
+
+    async fn issue_portal_auth_token(
+        &self,
+        request: Request<IssuePortalAuthTokenRequest>,
+    ) -> Result<Response<IssuePortalAuthTokenResponse>, Status> {
+        let req = request.into_inner();
+        if req.pilot_id.is_empty() {
+            return Err(Status::invalid_argument("pilot_id is required"));
+        }
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.portal_id.is_empty() {
+            return Err(Status::invalid_argument("portal_id is required"));
+        }
+        if req.jti.is_empty() {
+            return Err(Status::invalid_argument("jti is required"));
+        }
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot_id is not registered on this node"))?;
+        let profile = self
+            .ctx
+            .node
+            .load_registered_pilot_profile(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot profile is not registered on this node"))?;
+        let jwt = issue_pilot_profile_credential(
+            self.ctx.node.governance_store(),
+            &identity,
+            PilotProfileCredentialRequest {
+                subject: PilotProfileCredentialSubjectDraft {
+                    name: Some(profile.display_name),
+                    country: profile.country,
+                    ..PilotProfileCredentialSubjectDraft::default()
+                },
+                jti: req.jti,
+                audience: Some(req.portal_id),
+                expires_in_seconds: Some(match req.expires_in_seconds {
+                    0 => 3600,
+                    seconds => seconds.into(),
+                }),
+            },
+            &SystemClock,
+        )
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+        Ok(Response::new(IssuePortalAuthTokenResponse {
+            pilot_profile_vc_jwt: jwt.compact().to_string(),
+        }))
+    }
+
     async fn publish_flight(
         &self,
         request: Request<PublishFlightRequest>,
@@ -115,147 +359,92 @@ impl IgcNet for IgcNetService {
         };
 
         if mode == ProtoPublicationMode::Protected {
+            let requested_pilot_id = required_publish_pilot_id(&req.pilot_id)?;
             let identity = self
                 .ctx
                 .node
-                .load_or_generate_pilot_identity()
+                .load_registered_pilot_identity(&requested_pilot_id)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            let identity = identity
+                .ok_or_else(|| Status::not_found("pilot_id is not registered on this node"))?;
             let result = publish_protected(&self.ctx.node, req.raw_igc)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let created_at = canonical_utc_now();
-            let owner_claim = OwnerClaimRecord::issue(
-                &identity.pilot_id_secret_key(),
-                result.raw_igc_hash.clone(),
-                created_at.clone(),
-                Vec::new(),
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-            let publication_mode = PublicationModeRecord::issue(
-                &identity.pilot_id_secret_key(),
+            self.issue_publish_governance_records(
+                &identity,
                 result.raw_igc_hash.clone(),
                 StorePublicationMode::Protected,
                 Some(result.protected_hash.clone()),
-                None,
-                created_at,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .governance_store()
-                .persist_owner_claim_record(&owner_claim)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .governance_store()
-                .persist_publication_mode_record(&publication_mode)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .broadcast_governance_record(&owner_claim)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .broadcast_governance_record(&publication_mode)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            .await?;
 
-            self.ctx
-                .node
-                .store()
-                .append_artifact_registry_record(&ArtifactRegistryRecord {
-                    raw_igc_hash: result.raw_igc_hash.clone(),
-                    pilot_id: Some(identity.pilot_id()),
-                    publication_mode: StorePublicationMode::Protected,
-                    protected_hash: Some(result.protected_hash.clone()),
-                    has_raw_igc: true,
-                    has_protected_sanitized_igc: true,
-                    has_protected_raw_companion: true,
-                    serving_node_ids: vec![self.ctx.node.node_id().clone()],
-                    recorded_at: canonical_utc_now(),
-                })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            self.append_local_artifact_registry_record(
+                result.raw_igc_hash.clone(),
+                Some(identity.pilot_id()),
+                StorePublicationMode::Protected,
+                Some(result.protected_hash.clone()),
+                LocalArtifactAvailability::protected_publish(),
+                result.g_record_present,
+            )
+            .await?;
 
             return Ok(Response::new(PublishFlightResponse {
                 raw_igc_hash: result.raw_igc_hash.to_string(),
-                protected_hash: result.protected_hash.to_string(),
-                tickets: vec![result.protected_ticket],
-                companion_tickets: vec![result.raw_companion_ticket],
+                artifacts: vec![
+                    published_artifact(
+                        ProtoArtifactClass::ProtectedSanitizedIgc,
+                        &result.protected_hash,
+                        result.protected_ticket,
+                    ),
+                    published_artifact(
+                        ProtoArtifactClass::ProtectedRawCompanion,
+                        &result.raw_igc_hash,
+                        result.raw_companion_ticket,
+                    ),
+                ],
+                g_record_present: result.g_record_present,
             }));
         }
 
         if mode == ProtoPublicationMode::Private {
+            let requested_pilot_id = required_publish_pilot_id(&req.pilot_id)?;
             let identity = self
                 .ctx
                 .node
-                .load_or_generate_pilot_identity()
+                .load_registered_pilot_identity(&requested_pilot_id)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            let identity = identity
+                .ok_or_else(|| Status::not_found("pilot_id is not registered on this node"))?;
             self.require_publish_private_access_ready(&identity.pilot_id())?;
             let result = publish_private(&self.ctx.node, req.raw_igc)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let created_at = canonical_utc_now();
-            let owner_claim = OwnerClaimRecord::issue(
-                &identity.pilot_id_secret_key(),
-                result.raw_igc_hash.clone(),
-                created_at.clone(),
-                Vec::new(),
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-            let publication_mode = PublicationModeRecord::issue(
-                &identity.pilot_id_secret_key(),
+            self.issue_publish_governance_records(
+                &identity,
                 result.raw_igc_hash.clone(),
                 StorePublicationMode::Private,
                 None,
-                None,
-                created_at,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .governance_store()
-                .persist_owner_claim_record(&owner_claim)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .governance_store()
-                .persist_publication_mode_record(&publication_mode)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .broadcast_governance_record(&owner_claim)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.ctx
-                .node
-                .broadcast_governance_record(&publication_mode)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            .await?;
 
-            self.ctx
-                .node
-                .store()
-                .append_artifact_registry_record(&ArtifactRegistryRecord {
-                    raw_igc_hash: result.raw_igc_hash.clone(),
-                    pilot_id: Some(identity.pilot_id()),
-                    publication_mode: StorePublicationMode::Private,
-                    protected_hash: None,
-                    has_raw_igc: true,
-                    has_protected_sanitized_igc: false,
-                    has_protected_raw_companion: false,
-                    serving_node_ids: vec![self.ctx.node.node_id().clone()],
-                    recorded_at: canonical_utc_now(),
-                })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            self.append_local_artifact_registry_record(
+                result.raw_igc_hash.clone(),
+                Some(identity.pilot_id()),
+                StorePublicationMode::Private,
+                None,
+                LocalArtifactAvailability::raw_only(),
+                result.g_record_present,
+            )
+            .await?;
 
             return Ok(Response::new(PublishFlightResponse {
                 raw_igc_hash: result.raw_igc_hash.to_string(),
-                protected_hash: String::new(),
-                tickets: vec![result.raw_igc_ticket],
-                companion_tickets: Vec::new(),
+                artifacts: vec![published_artifact(
+                    ProtoArtifactClass::PrivateRawIgc,
+                    &result.raw_igc_hash,
+                    result.raw_igc_ticket,
+                )],
+                g_record_present: result.g_record_present,
             }));
         }
 
@@ -263,28 +452,24 @@ impl IgcNet for IgcNetService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        self.ctx
-            .node
-            .store()
-            .append_artifact_registry_record(&ArtifactRegistryRecord {
-                raw_igc_hash: result.igc_hash.clone(),
-                pilot_id: None,
-                publication_mode: StorePublicationMode::Public,
-                protected_hash: None,
-                has_raw_igc: true,
-                has_protected_sanitized_igc: false,
-                has_protected_raw_companion: false,
-                serving_node_ids: vec![self.ctx.node.node_id().clone()],
-                recorded_at: canonical_utc_now(),
-            })
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.append_local_artifact_registry_record(
+            result.igc_hash.clone(),
+            None,
+            StorePublicationMode::Public,
+            None,
+            LocalArtifactAvailability::raw_only(),
+            result.g_record_present,
+        )
+        .await?;
 
         Ok(Response::new(PublishFlightResponse {
             raw_igc_hash: result.igc_hash.to_string(),
-            protected_hash: String::new(),
-            tickets: vec![result.igc_ticket],
-            companion_tickets: Vec::new(),
+            artifacts: vec![published_artifact(
+                ProtoArtifactClass::PublicRawIgc,
+                &result.igc_hash,
+                result.igc_ticket,
+            )],
+            g_record_present: result.g_record_present,
         }))
     }
 
@@ -314,6 +499,13 @@ impl IgcNet for IgcNetService {
         let publication_mode_record =
             self.authorized_publication_mode_record(&record, governance_state.as_ref())?;
         let effective = effective_artifact_state(&record, publication_mode_record.as_ref());
+
+        // Group-based access path: check before publication-mode gate.
+        if let Some(group_proof_proto) = &req.group_fetch_proof {
+            return self
+                .handle_group_fetch(&req, &record, governance_state.as_ref(), group_proof_proto)
+                .await;
+        }
 
         let restricted_class = restricted_artifact_class(req.artifact_class);
         if governance_requires_restricted_plaintext_purge(governance_state.as_ref()) {
@@ -547,6 +739,589 @@ impl IgcNet for IgcNetService {
             tombstone_retained: purge.tombstone_retained,
         }))
     }
+
+// ── Group RPC implementations ─────────────────────────────────────────────────
+
+    async fn create_group(
+        &self,
+        request: Request<CreateGroupRequest>,
+    ) -> Result<Response<CreateGroupResponse>, Status> {
+        let req = request.into_inner();
+        let record: GroupCreationRecord = serde_json::from_str(&req.signed_record_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid group creation record: {e}")))?;
+        let group_id = record.group_id.to_string();
+        self.ctx
+            .group_store
+            .create_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateGroupResponse { group_id }))
+    }
+
+    async fn add_private_group_member(
+        &self,
+        request: Request<AddPrivateGroupMemberRequest>,
+    ) -> Result<Response<AddPrivateGroupMemberResponse>, Status> {
+        let req = request.into_inner();
+        let record: PrivateGroupMemberAddRecord =
+            serde_json::from_str(&req.signed_record_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid private group member add record: {e}"))
+            })?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .add_private_group_member(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(AddPrivateGroupMemberResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn remove_private_group_member(
+        &self,
+        request: Request<RemovePrivateGroupMemberRequest>,
+    ) -> Result<Response<RemovePrivateGroupMemberResponse>, Status> {
+        let req = request.into_inner();
+        let record: PrivateGroupMemberRemoveRecord =
+            serde_json::from_str(&req.signed_record_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "invalid private group member remove record: {e}"
+                ))
+            })?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .remove_private_group_member(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RemovePrivateGroupMemberResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn invite_to_public_group(
+        &self,
+        request: Request<InviteToPublicGroupRequest>,
+    ) -> Result<Response<InviteToPublicGroupResponse>, Status> {
+        let req = request.into_inner();
+        let record: PublicGroupInviteRecord =
+            serde_json::from_str(&req.signed_record_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid public group invite record: {e}"))
+            })?;
+        let group_id = record.group_id.to_string();
+        let invited_pilot_id = record.invited_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .invite_to_public_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(InviteToPublicGroupResponse {
+            group_id,
+            invited_pilot_id,
+        }))
+    }
+
+    async fn accept_group_invitation(
+        &self,
+        request: Request<AcceptGroupInvitationRequest>,
+    ) -> Result<Response<AcceptGroupInvitationResponse>, Status> {
+        let req = request.into_inner();
+        let record: PublicGroupAcceptRecord =
+            serde_json::from_str(&req.signed_record_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid public group accept record: {e}"))
+            })?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .accept_group_invitation(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(AcceptGroupInvitationResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn leave_group(
+        &self,
+        request: Request<LeaveGroupRequest>,
+    ) -> Result<Response<LeaveGroupResponse>, Status> {
+        let req = request.into_inner();
+        let record: PublicGroupLeaveRecord = serde_json::from_str(&req.signed_record_json)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid public group leave record: {e}"))
+            })?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .leave_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(LeaveGroupResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn portal_create_group(
+        &self,
+        request: Request<PortalCreateGroupRequest>,
+    ) -> Result<Response<CreateGroupResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_type = match ProtoGroupType::try_from(req.group_type) {
+            Ok(ProtoGroupType::Private) => GroupType::Private,
+            Ok(ProtoGroupType::Public) => GroupType::Public,
+            _ => return Err(Status::invalid_argument("group_type is required")),
+        };
+        let name = if req.name.is_empty() { None } else { Some(req.name) };
+        let record = GroupCreationRecord::issue(&signing_key, group_type, name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        self.ctx
+            .group_store
+            .create_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateGroupResponse { group_id }))
+    }
+
+    async fn portal_add_private_group_member(
+        &self,
+        request: Request<PortalAddPrivateGroupMemberRequest>,
+    ) -> Result<Response<AddPrivateGroupMemberResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_id =
+            GroupId::parse(req.group_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let member_pilot_id = PilotId::parse(req.member_pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let record =
+            PrivateGroupMemberAddRecord::issue(&signing_key, group_id, member_pilot_id)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .add_private_group_member(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(AddPrivateGroupMemberResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn portal_remove_private_group_member(
+        &self,
+        request: Request<PortalRemovePrivateGroupMemberRequest>,
+    ) -> Result<Response<RemovePrivateGroupMemberResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_id =
+            GroupId::parse(req.group_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let member_pilot_id = PilotId::parse(req.member_pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let record =
+            PrivateGroupMemberRemoveRecord::issue(&signing_key, group_id, member_pilot_id)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .remove_private_group_member(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RemovePrivateGroupMemberResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn portal_invite_to_public_group(
+        &self,
+        request: Request<PortalInviteToPublicGroupRequest>,
+    ) -> Result<Response<InviteToPublicGroupResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_id =
+            GroupId::parse(req.group_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let invited_pilot_id = PilotId::parse(req.invited_pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let record =
+            PublicGroupInviteRecord::issue(&signing_key, group_id, invited_pilot_id)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        let invited_pilot_id = record.invited_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .invite_to_public_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(InviteToPublicGroupResponse {
+            group_id,
+            invited_pilot_id,
+        }))
+    }
+
+    async fn portal_accept_group_invitation(
+        &self,
+        request: Request<PortalAcceptGroupInvitationRequest>,
+    ) -> Result<Response<AcceptGroupInvitationResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_id =
+            GroupId::parse(req.group_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let record = PublicGroupAcceptRecord::issue(&signing_key, group_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .accept_group_invitation(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(AcceptGroupInvitationResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn portal_leave_group(
+        &self,
+        request: Request<PortalLeaveGroupRequest>,
+    ) -> Result<Response<LeaveGroupResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id =
+            PilotId::parse(req.pilot_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.access_pin.is_empty() {
+            return Err(Status::invalid_argument("access_pin is required"));
+        }
+        if !self
+            .ctx
+            .node
+            .verify_pilot_credential(&pilot_id, &req.access_pin)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::unauthenticated("invalid pilot credential"));
+        }
+        let identity = self
+            .ctx
+            .node
+            .load_registered_pilot_identity(&pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("pilot not found"))?;
+        let signing_key = identity.pilot_id_secret_key();
+        let group_id =
+            GroupId::parse(req.group_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let record = PublicGroupLeaveRecord::issue(&signing_key, group_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let group_id = record.group_id.to_string();
+        let member_pilot_id = record.member_pilot_id.to_string();
+        self.ctx
+            .group_store
+            .leave_group(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(LeaveGroupResponse {
+            group_id,
+            member_pilot_id,
+        }))
+    }
+
+    async fn list_my_groups(
+        &self,
+        request: Request<ListMyGroupsRequest>,
+    ) -> Result<Response<ListMyGroupsResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id = PilotId::parse(req.pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let memberships = self.ctx.group_store.list_pilot_groups(&pilot_id);
+        let groups = memberships.into_iter().map(group_membership_to_proto).collect();
+        Ok(Response::new(ListMyGroupsResponse { groups }))
+    }
+
+    async fn get_group(
+        &self,
+        request: Request<GetGroupRequest>,
+    ) -> Result<Response<GetGroupResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = GroupId::parse(req.group_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let meta = self
+            .ctx
+            .group_store
+            .group_meta(&group_id)
+            .ok_or_else(|| Status::not_found("group not found"))?;
+        let requester = if req.requester_pilot_id.is_empty() {
+            None
+        } else {
+            Some(
+                PilotId::parse(req.requester_pilot_id)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
+            )
+        };
+        let is_owner = requester.as_ref().map(|r| r == &meta.creator_pilot_id).unwrap_or(false);
+        Ok(Response::new(GetGroupResponse {
+            group: Some(meta_to_group_summary(&group_id, &meta, is_owner)),
+        }))
+    }
+
+    async fn lookup_group_by_name(
+        &self,
+        request: Request<LookupGroupByNameRequest>,
+    ) -> Result<Response<LookupGroupByNameResponse>, Status> {
+        let req = request.into_inner();
+        let meta = self
+            .ctx
+            .group_store
+            .lookup_by_name(&req.name)
+            .ok_or_else(|| Status::not_found("no group with that name"))?;
+        let requester = if req.requester_pilot_id.is_empty() {
+            None
+        } else {
+            Some(
+                PilotId::parse(req.requester_pilot_id)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
+            )
+        };
+        let is_owner = requester.as_ref().map(|r| r == &meta.creator_pilot_id).unwrap_or(false);
+        Ok(Response::new(LookupGroupByNameResponse {
+            group: Some(meta_to_group_summary(&meta.group_id, &meta, is_owner)),
+        }))
+    }
+
+    async fn list_group_members(
+        &self,
+        request: Request<ListGroupMembersRequest>,
+    ) -> Result<Response<ListGroupMembersResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = GroupId::parse(req.group_id.clone())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let requester = PilotId::parse(req.requester_pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let meta = self
+            .ctx
+            .group_store
+            .group_meta(&group_id)
+            .ok_or_else(|| Status::not_found("group not found"))?;
+        let member_pilot_ids = match meta.group_type {
+            GroupType::Private => {
+                if requester != meta.creator_pilot_id {
+                    return Err(Status::permission_denied(
+                        "private group member list is owner-only",
+                    ));
+                }
+                self.ctx
+                    .group_store
+                    .list_private_group_members(&group_id)
+                    .into_iter()
+                    .map(|p| p.to_string())
+                    .collect()
+            }
+            GroupType::Public => {
+                let members = self.ctx.group_store.list_group_members(&group_id);
+                if !members.contains(&requester) {
+                    return Err(Status::permission_denied(
+                        "must be a member to list public group members",
+                    ));
+                }
+                members.into_iter().map(|p| p.to_string()).collect()
+            }
+        };
+        Ok(Response::new(ListGroupMembersResponse {
+            group_id: req.group_id,
+            member_pilot_ids,
+        }))
+    }
+
+    async fn get_pending_invitations(
+        &self,
+        request: Request<GetPendingInvitationsRequest>,
+    ) -> Result<Response<GetPendingInvitationsResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id = PilotId::parse(req.pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let groups = self
+            .ctx
+            .group_store
+            .list_pending_invitations(&pilot_id)
+            .into_iter()
+            .filter_map(|g| {
+                let meta = self.ctx.group_store.group_meta(&g)?;
+                Some(meta_to_group_summary(&g, &meta, false))
+            })
+            .collect();
+        Ok(Response::new(GetPendingInvitationsResponse { groups }))
+    }
+
+// ── Follow RPC implementations ────────────────────────────────────────────────
+
+    async fn follow_pilot(
+        &self,
+        request: Request<FollowPilotRequest>,
+    ) -> Result<Response<FollowPilotResponse>, Status> {
+        let req = request.into_inner();
+        let record: FollowRecord = serde_json::from_str(&req.signed_record_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid follow record: {e}")))?;
+        let follower = record.follower_pilot_id.to_string();
+        let followee = record.followee_pilot_id.to_string();
+        self.ctx
+            .follow_store
+            .follow_pilot(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(FollowPilotResponse {
+            follower_pilot_id: follower,
+            followee_pilot_id: followee,
+        }))
+    }
+
+    async fn unfollow_pilot(
+        &self,
+        request: Request<UnfollowPilotRequest>,
+    ) -> Result<Response<UnfollowPilotResponse>, Status> {
+        let req = request.into_inner();
+        let record: UnfollowRecord = serde_json::from_str(&req.signed_record_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid unfollow record: {e}")))?;
+        let follower = record.follower_pilot_id.to_string();
+        let followee = record.followee_pilot_id.to_string();
+        self.ctx
+            .follow_store
+            .unfollow_pilot(record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(UnfollowPilotResponse {
+            follower_pilot_id: follower,
+            followee_pilot_id: followee,
+        }))
+    }
+
+    async fn list_following(
+        &self,
+        request: Request<ListFollowingRequest>,
+    ) -> Result<Response<ListFollowingResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id = PilotId::parse(req.pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let followees = self
+            .ctx
+            .follow_store
+            .list_following(&pilot_id)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        Ok(Response::new(ListFollowingResponse {
+            followee_pilot_ids: followees,
+        }))
+    }
+
+    async fn list_followers(
+        &self,
+        request: Request<ListFollowersRequest>,
+    ) -> Result<Response<ListFollowersResponse>, Status> {
+        let req = request.into_inner();
+        let pilot_id = PilotId::parse(req.pilot_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let followers = self
+            .ctx
+            .follow_store
+            .list_followers(&pilot_id)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        Ok(Response::new(ListFollowersResponse {
+            follower_pilot_ids: followers,
+        }))
+    }
 }
 
 // ── Restricted-fetch helper ───────────────────────────────────────────────────
@@ -685,11 +1460,7 @@ impl IgcNetService {
         Ok(IndexEntry {
             raw_igc_hash: record.raw_igc_hash.to_string(),
             publication_mode: proto_publication_mode(&effective.publication_mode),
-            protected_hash: effective
-                .protected_hash
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
+            protected_hash: effective.protected_hash.as_ref().map(ToString::to_string),
             serving_node_ids: record
                 .serving_node_ids
                 .iter()
@@ -705,6 +1476,7 @@ impl IgcNetService {
                 governance_state.as_ref(),
             ),
             updated_event_seq: seq,
+            g_record_present: record.g_record_present,
         })
     }
 
@@ -853,6 +1625,100 @@ impl IgcNetService {
 
         verify_fetch_proof(&proof, &authorized_public_key, rust_class, last_seen)
             .map_err(fetch_proof_error_to_status)
+    }
+
+    async fn handle_group_fetch(
+        &self,
+        req: &FetchArtifactRequest,
+        record: &ArtifactRegistryRecord,
+        governance_state: Option<&FlightGovernanceState>,
+        group_proof_proto: &crate::proto::GroupFetchProof,
+    ) -> Result<Response<FetchArtifactResponse>, Status> {
+        // Only private_raw_igc is served via group access.
+        let rust_class = ArtifactClass::PrivateRawIgc;
+
+        // Governance still blocks group access for contested/rejected flights.
+        self.enforce_flight_governance(record, governance_state, true)?;
+
+        if !record.has_raw_igc {
+            return Err(Status::not_found(
+                "raw IGC is not available locally for group fetch",
+            ));
+        }
+
+        let owner = record.pilot_id.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "group-fetch: artifact has no pilot owner in artifact registry",
+            )
+        })?;
+
+        // Build and verify the GroupFetchProof.
+        let signature_hex = hex::encode(&group_proof_proto.signature);
+        let proof = igc_net::GroupFetchProof {
+            schema: "igc-net/group-fetch-request".to_string(),
+            schema_version: 1,
+            raw_igc_hash: req.raw_igc_hash.clone(),
+            artifact_class: rust_class.clone(),
+            requester_pilot_id: group_proof_proto.requester_pilot_id.clone(),
+            group_id: group_proof_proto.group_id.clone(),
+            seq_num: group_proof_proto.seq_num,
+            signature: signature_hex,
+        };
+
+        let last_seen = self
+            .ctx
+            .group_seq_num_store
+            .last_seen(&group_proof_proto.requester_pilot_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        verify_group_fetch_proof(&proof, &rust_class, last_seen)
+            .map_err(group_fetch_proof_error_to_status)?;
+
+        // Check group membership.
+        let requester = PilotId::parse(group_proof_proto.requester_pilot_id.clone())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let group_access = self
+            .ctx
+            .group_store
+            .pilot_has_private_group_access(&requester, owner)
+            || self
+                .ctx
+                .group_store
+                .pilots_share_public_group(&requester, owner);
+
+        if !group_access {
+            return Err(Status::unauthenticated(
+                "requester is not in any group that grants access to this artifact",
+            ));
+        }
+
+        // Advance group seq_num durably BEFORE transmitting bytes.
+        self.ctx
+            .group_seq_num_store
+            .advance(&group_proof_proto.requester_pilot_id, group_proof_proto.seq_num)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let artifact_hash = record.raw_igc_hash.clone();
+        let blob = self
+            .ctx
+            .node
+            .store()
+            .get(&artifact_hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("artifact not found in local store"))?;
+
+        let actual_hash = Blake3Hex::from_hash(blake3::hash(&blob));
+        if actual_hash != artifact_hash {
+            return Err(Status::internal("artifact bytes do not match registry hash"));
+        }
+
+        Ok(Response::new(FetchArtifactResponse {
+            artifact_bytes: blob,
+            artifact_hash: artifact_hash.to_string(),
+            raw_igc_hash: req.raw_igc_hash.clone(),
+            artifact_class: PROTO_CLASS_PRIVATE_RAW_IGC,
+        }))
     }
 
     fn require_publish_private_access_ready(&self, pilot_id: &PilotId) -> Result<(), Status> {
@@ -1022,6 +1888,50 @@ fn governance_requires_restricted_plaintext_purge(
     })
 }
 
+fn group_fetch_proof_error_to_status(e: igc_net::GroupFetchProofError) -> Status {
+    use igc_net::GroupFetchProofError::*;
+    match e {
+        SignatureVerification | ArtifactClassMismatch => Status::unauthenticated(e.to_string()),
+        SeqNumNotMonotonic { .. } | SeqNumZero => Status::unauthenticated(e.to_string()),
+        InvalidHash | InvalidRequesterPilotId | InvalidGroupId | InvalidSignatureEncoding => {
+            Status::invalid_argument(e.to_string())
+        }
+        Json(_) => Status::internal(e.to_string()),
+    }
+}
+
+fn meta_to_group_summary(
+    group_id: &GroupId,
+    meta: &igc_net::GroupCreationRecord,
+    is_owner: bool,
+) -> GroupSummary {
+    let group_type = match meta.group_type {
+        GroupType::Private => ProtoGroupType::Private as i32,
+        GroupType::Public => ProtoGroupType::Public as i32,
+    };
+    GroupSummary {
+        group_id: group_id.to_string(),
+        group_type,
+        creator_pilot_id: meta.creator_pilot_id.to_string(),
+        name: meta.name.clone().unwrap_or_default(),
+        is_owner,
+    }
+}
+
+fn group_membership_to_proto(m: GroupMembership) -> GroupSummary {
+    let group_type = match m.group_type {
+        GroupType::Private => ProtoGroupType::Private as i32,
+        GroupType::Public => ProtoGroupType::Public as i32,
+    };
+    GroupSummary {
+        group_id: m.group_id.to_string(),
+        group_type,
+        creator_pilot_id: m.creator_pilot_id.to_string(),
+        name: m.name.unwrap_or_default(),
+        is_owner: m.is_owner,
+    }
+}
+
 fn fetch_proof_error_to_status(e: igc_net::FetchProofError) -> Status {
     use igc_net::FetchProofError::*;
     match e {
@@ -1096,6 +2006,31 @@ fn index_entry_locally_fetchable(
     }
 }
 
+fn published_artifact(
+    artifact_class: ProtoArtifactClass,
+    artifact_hash: &Blake3Hex,
+    ticket: String,
+) -> PublishedArtifact {
+    PublishedArtifact {
+        artifact_class: artifact_class as i32,
+        artifact_hash: artifact_hash.to_string(),
+        ticket,
+    }
+}
+
+fn required_publish_pilot_id(value: &str) -> Result<PilotId, Status> {
+    if value.is_empty() {
+        return Err(Status::invalid_argument(
+            "pilot_id is required for protected and private publication modes",
+        ));
+    }
+    PilotId::parse(value.to_string()).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+fn is_iso_3166_alpha2(value: &str) -> bool {
+    value.len() == 2 && value.bytes().all(|b| b.is_ascii_uppercase())
+}
+
 fn canonical_utc_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
@@ -1109,8 +2044,11 @@ mod tests {
     use futures::StreamExt;
 
     use crate::proto::{
-        ArtifactClass as ProtoArtifactClass, EventKind as ProtoEventKind, PublicationMode,
-        QueryIndexRequest,
+        ArtifactClass as ProtoArtifactClass, EventKind as ProtoEventKind,
+        GroupType as ProtoGroupType, PortalAcceptGroupInvitationRequest,
+        PortalAddPrivateGroupMemberRequest, PortalCreateGroupRequest,
+        PortalInviteToPublicGroupRequest, PortalLeaveGroupRequest,
+        PortalRemovePrivateGroupMemberRequest, PublicationMode, QueryIndexRequest,
     };
     use igc_net::{
         ClaimApprovalRecord, DeletionRequestRecord, PrivateAccessRotationRecord,
@@ -1119,6 +2057,17 @@ mod tests {
 
     fn secret_key(byte: u8) -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&[byte; 32])
+    }
+
+    fn published_response_artifact(
+        response: &PublishFlightResponse,
+        artifact_class: ProtoArtifactClass,
+    ) -> &PublishedArtifact {
+        response
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_class == artifact_class as i32)
+            .unwrap()
     }
 
     static TEST_NODE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -1171,11 +2120,18 @@ mod tests {
         let node = IgcIrohNode::start(dir.path()).await.unwrap();
         let node_secret_key =
             iroh::SecretKey::from_bytes(&node.store().load_key_bytes().unwrap().unwrap());
+        let group_store = igc_net::GroupStore::for_data_dir(dir.path());
+        group_store.init().unwrap();
+        let follow_store = igc_net::FollowStore::for_data_dir(dir.path());
+        follow_store.init().unwrap();
         let ctx = Arc::new(NodeContext {
             node,
             node_secret_key,
             private_access_key_store: PrivateAccessKeyStore::for_data_dir(dir.path()),
             seq_num_store: SeqNumStore::for_data_dir(dir.path()),
+            group_store,
+            follow_store,
+            group_seq_num_store: SeqNumStore::for_group_fetch_data_dir(dir.path()),
         });
         (IgcNetService::new(ctx.clone()), ctx, dir, guard)
     }
@@ -1189,15 +2145,18 @@ mod tests {
                 raw_igc: b"HFDTE020714\r\nB1300004730000N00837000EA0030003000\r\n".to_vec(),
                 filename: "flight.igc".to_string(),
                 publication_mode: PublicationMode::Public as i32,
+                pilot_id: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
 
         assert_eq!(response.raw_igc_hash.len(), 64);
-        assert!(response.protected_hash.is_empty());
-        assert_eq!(response.tickets.len(), 1);
-        assert!(response.companion_tickets.is_empty());
+        assert_eq!(response.artifacts.len(), 1);
+        let public_artifact =
+            published_response_artifact(&response, ProtoArtifactClass::PublicRawIgc);
+        assert_eq!(public_artifact.artifact_hash, response.raw_igc_hash);
+        assert!(!public_artifact.ticket.is_empty());
 
         let records = ctx.node.store().artifact_registry_records().unwrap();
         assert_eq!(records.len(), 1);
@@ -1252,6 +2211,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pilots_returns_registered_multi_pilot_profiles() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+        let alice = ctx
+            .node
+            .generate_pilot_identity("Alice", Some("NO".to_string()))
+            .unwrap();
+        let bob = ctx.node.generate_pilot_identity("Bob", None).unwrap();
+
+        let response = service
+            .list_pilots(Request::new(ListPilotsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.pilots.len(), 2);
+        assert!(response.pilots.iter().any(|pilot| {
+            pilot.pilot_id == alice.pilot_id().to_string()
+                && pilot.display_name == "Alice"
+                && pilot.country == "NO"
+        }));
+        assert!(response.pilots.iter().any(|pilot| {
+            pilot.pilot_id == bob.pilot_id().to_string()
+                && pilot.display_name == "Bob"
+                && pilot.country.is_empty()
+        }));
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
+    async fn register_pilot_persists_identity_credential_and_auth_did_governance() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+
+        let response = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Alice".to_string(),
+                access_pin: "1234".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pilot_id = PilotId::parse(response.pilot_id.clone()).unwrap();
+        assert_eq!(response.display_name, "Alice");
+        assert!(response.pilot_auth_did.starts_with("did:key:"));
+        assert!(
+            ctx.node
+                .load_registered_pilot_identity(&pilot_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(ctx.node.verify_pilot_credential(&pilot_id, "1234").unwrap());
+        assert_eq!(
+            ctx.node
+                .resolve_pilot_auth_did_state(&pilot_id)
+                .unwrap()
+                .authoritative
+                .unwrap()
+                .pilot_auth_did
+                .to_string(),
+            response.pilot_auth_did
+        );
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
+    async fn issue_portal_auth_token_verifies_pin_and_returns_profile_vc_jwt() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+        let registered = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Alice".to_string(),
+                access_pin: "1234".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let response = service
+            .issue_portal_auth_token(Request::new(IssuePortalAuthTokenRequest {
+                pilot_id: registered.pilot_id.clone(),
+                portal_id: "cs-archive-local".to_string(),
+                jti: "test-jti".to_string(),
+                access_pin: "1234".to_string(),
+                expires_in_seconds: 60,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let jwt =
+            igc_net::PilotProfileCredentialJwt::parse(&response.pilot_profile_vc_jwt).unwrap();
+        jwt.verify_signature().unwrap();
+        assert_eq!(jwt.claims().sub.to_string(), registered.pilot_id);
+        assert_eq!(jwt.claims().jti, "test-jti");
+        assert_eq!(
+            jwt.claims().vc.credential_subject.name.as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            jwt.claims().vc.credential_subject.country.as_deref(),
+            Some("NO")
+        );
+
+        let bad_pin = service
+            .issue_portal_auth_token(Request::new(IssuePortalAuthTokenRequest {
+                pilot_id: registered.pilot_id,
+                portal_id: "cs-archive-local".to_string(),
+                jti: "test-jti-2".to_string(),
+                access_pin: "9999".to_string(),
+                expires_in_seconds: 60,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_pin.code(), tonic::Code::Unauthenticated);
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
     async fn publish_flight_rejects_private_mode_without_registry_mutation() {
         let (service, ctx, _dir, _guard) = temp_service().await;
 
@@ -1260,11 +2341,12 @@ mod tests {
                 raw_igc: b"HFDTE020714\r\nB1300004730000N00837000EA0030003000\r\n".to_vec(),
                 filename: "flight.igc".to_string(),
                 publication_mode: PublicationMode::Private as i32,
+                pilot_id: String::new(),
             }))
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(
             ctx.node
                 .store()
@@ -1279,7 +2361,10 @@ mod tests {
     #[tokio::test]
     async fn publish_flight_private_requires_and_uses_local_private_access_workflow() {
         let (service, ctx, _dir, _guard) = temp_service().await;
-        let identity = ctx.node.load_or_generate_pilot_identity().unwrap();
+        let identity = ctx
+            .node
+            .generate_pilot_identity("Test Pilot", None)
+            .unwrap();
         let private_access_key = secret_key(45);
         persist_private_access_rotation(&ctx, &identity.pilot_id_secret_key(), &private_access_key);
         ctx.private_access_key_store
@@ -1297,15 +2382,18 @@ mod tests {
                 raw_igc: raw_igc.to_vec(),
                 filename: "private.igc".to_string(),
                 publication_mode: PublicationMode::Private as i32,
+                pilot_id: identity.pilot_id().to_string(),
             }))
             .await
             .unwrap()
             .into_inner();
 
         assert_eq!(response.raw_igc_hash, expected_raw_hash.to_string());
-        assert!(response.protected_hash.is_empty());
-        assert_eq!(response.tickets.len(), 1);
-        assert!(response.companion_tickets.is_empty());
+        assert_eq!(response.artifacts.len(), 1);
+        let private_artifact =
+            published_response_artifact(&response, ProtoArtifactClass::PrivateRawIgc);
+        assert_eq!(private_artifact.artifact_hash, response.raw_igc_hash);
+        assert!(!private_artifact.ticket.is_empty());
 
         let registry = ctx
             .node
@@ -1356,6 +2444,7 @@ mod tests {
                 requester_key: proof.requester_key,
                 seq_num: proof.seq_num,
                 signature: hex::decode(proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1402,6 +2491,7 @@ mod tests {
                 requester_key: proof.requester_key,
                 seq_num: proof.seq_num,
                 signature: hex::decode(proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap()
@@ -1414,6 +2504,10 @@ mod tests {
     #[tokio::test]
     async fn publish_flight_protected_populates_governance_registry_and_serves_sanitized() {
         let (service, ctx, _dir, _guard) = temp_service().await;
+        let identity = ctx
+            .node
+            .generate_pilot_identity("Test Pilot", None)
+            .unwrap();
         let raw_igc =
             b"HFPLTPILOT:Alice\r\nHFCIDCOMPETITION:ABC\r\nB1300004730000N00837000EA0030003000\r\n";
         let sanitized =
@@ -1426,15 +2520,25 @@ mod tests {
                 raw_igc: raw_igc.to_vec(),
                 filename: "protected.igc".to_string(),
                 publication_mode: PublicationMode::Protected as i32,
+                pilot_id: identity.pilot_id().to_string(),
             }))
             .await
             .unwrap()
             .into_inner();
 
         assert_eq!(response.raw_igc_hash, expected_raw_hash.to_string());
-        assert_eq!(response.protected_hash, expected_protected_hash.to_string());
-        assert_eq!(response.tickets.len(), 1);
-        assert_eq!(response.companion_tickets.len(), 1);
+        assert_eq!(response.artifacts.len(), 2);
+        let protected_artifact =
+            published_response_artifact(&response, ProtoArtifactClass::ProtectedSanitizedIgc);
+        let companion_artifact =
+            published_response_artifact(&response, ProtoArtifactClass::ProtectedRawCompanion);
+        assert_eq!(
+            protected_artifact.artifact_hash,
+            expected_protected_hash.to_string()
+        );
+        assert_eq!(companion_artifact.artifact_hash, response.raw_igc_hash);
+        assert!(!protected_artifact.ticket.is_empty());
+        assert!(!companion_artifact.ticket.is_empty());
 
         let registry = ctx
             .node
@@ -1489,7 +2593,10 @@ mod tests {
             query.entries[0].publication_mode,
             PublicationMode::Protected as i32
         );
-        assert_eq!(query.entries[0].protected_hash, response.protected_hash);
+        assert_eq!(
+            query.entries[0].protected_hash,
+            Some(protected_artifact.artifact_hash.clone())
+        );
         assert_eq!(
             query.entries[0].locally_available_artifact_classes,
             vec![
@@ -1505,6 +2612,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap()
@@ -1519,6 +2627,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1544,6 +2653,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1556,6 +2666,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1584,6 +2695,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1626,6 +2738,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1654,6 +2767,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1692,6 +2806,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap()
@@ -1739,6 +2854,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1758,6 +2874,7 @@ mod tests {
                 requester_key: other_proof.requester_key,
                 seq_num: other_proof.seq_num,
                 signature: hex::decode(other_proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1777,6 +2894,7 @@ mod tests {
                 requester_key: owner_proof.requester_key,
                 seq_num: owner_proof.seq_num,
                 signature: hex::decode(owner_proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap()
@@ -1875,6 +2993,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1894,6 +3013,7 @@ mod tests {
                 requester_key: old_proof.requester_key,
                 seq_num: old_proof.seq_num,
                 signature: hex::decode(old_proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1927,6 +3047,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1946,6 +3067,7 @@ mod tests {
                 requester_key: proof.requester_key,
                 seq_num: proof.seq_num,
                 signature: hex::decode(proof.signature).unwrap(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -1973,6 +3095,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -1995,6 +3118,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -2023,6 +3147,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -2043,6 +3168,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -2074,6 +3200,7 @@ mod tests {
                 has_protected_sanitized_igc: true,
                 has_protected_raw_companion: true,
                 serving_node_ids: vec![ctx.node.node_id().clone()],
+                g_record_present: None,
                 recorded_at: canonical_utc_now(),
             })
             .await
@@ -2094,6 +3221,7 @@ mod tests {
                 requester_key: String::new(),
                 seq_num: 0,
                 signature: Vec::new(),
+                group_fetch_proof: None,
             }))
             .await
             .unwrap_err();
@@ -2112,6 +3240,218 @@ mod tests {
         assert!(tombstone.has_protected_sanitized_igc);
         assert_eq!(tombstone.protected_hash, Some(protected_hash));
         assert_eq!(tombstone.serving_node_ids, vec![ctx.node.node_id().clone()]);
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
+    async fn portal_create_group_verifies_pin_and_creates_group() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+        let registered = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Alice".to_string(),
+                access_pin: "secret1234".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let bad_pin = service
+            .portal_create_group(Request::new(PortalCreateGroupRequest {
+                pilot_id: registered.pilot_id.clone(),
+                access_pin: "wrongpin".to_string(),
+                group_type: ProtoGroupType::Private as i32,
+                name: "My Group".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_pin.code(), tonic::Code::Unauthenticated);
+
+        let response = service
+            .portal_create_group(Request::new(PortalCreateGroupRequest {
+                pilot_id: registered.pilot_id.clone(),
+                access_pin: "secret1234".to_string(),
+                group_type: ProtoGroupType::Private as i32,
+                name: "My Group".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.group_id.starts_with("igcnet:group:"));
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
+    async fn portal_add_and_remove_private_group_member_verifies_pin() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+        let alice = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Alice".to_string(),
+                access_pin: "alicepin123".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let bob = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Bob".to_string(),
+                access_pin: "bobpin1234".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let group = service
+            .portal_create_group(Request::new(PortalCreateGroupRequest {
+                pilot_id: alice.pilot_id.clone(),
+                access_pin: "alicepin123".to_string(),
+                group_type: ProtoGroupType::Private as i32,
+                name: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let bad_pin = service
+            .portal_add_private_group_member(Request::new(
+                PortalAddPrivateGroupMemberRequest {
+                    pilot_id: alice.pilot_id.clone(),
+                    access_pin: "wrong".to_string(),
+                    group_id: group.group_id.clone(),
+                    member_pilot_id: bob.pilot_id.clone(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_pin.code(), tonic::Code::Unauthenticated);
+
+        let add_resp = service
+            .portal_add_private_group_member(Request::new(
+                PortalAddPrivateGroupMemberRequest {
+                    pilot_id: alice.pilot_id.clone(),
+                    access_pin: "alicepin123".to_string(),
+                    group_id: group.group_id.clone(),
+                    member_pilot_id: bob.pilot_id.clone(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(add_resp.group_id, group.group_id);
+        assert_eq!(add_resp.member_pilot_id, bob.pilot_id);
+
+        let remove_resp = service
+            .portal_remove_private_group_member(Request::new(
+                PortalRemovePrivateGroupMemberRequest {
+                    pilot_id: alice.pilot_id.clone(),
+                    access_pin: "alicepin123".to_string(),
+                    group_id: group.group_id.clone(),
+                    member_pilot_id: bob.pilot_id.clone(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(remove_resp.group_id, group.group_id);
+        assert_eq!(remove_resp.member_pilot_id, bob.pilot_id);
+
+        ctx.node.close().await;
+    }
+
+    #[tokio::test]
+    async fn portal_invite_accept_leave_public_group_verifies_pin() {
+        let (service, ctx, _dir, _guard) = temp_service().await;
+        let alice = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Alice".to_string(),
+                access_pin: "alicepin123".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let bob = service
+            .register_pilot(Request::new(RegisterPilotRequest {
+                display_name: "Bob".to_string(),
+                access_pin: "bobpin1234".to_string(),
+                country: "NO".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let group = service
+            .portal_create_group(Request::new(PortalCreateGroupRequest {
+                pilot_id: alice.pilot_id.clone(),
+                access_pin: "alicepin123".to_string(),
+                group_type: ProtoGroupType::Public as i32,
+                name: "PublicClub".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let bad_pin = service
+            .portal_invite_to_public_group(Request::new(PortalInviteToPublicGroupRequest {
+                pilot_id: alice.pilot_id.clone(),
+                access_pin: "wrong".to_string(),
+                group_id: group.group_id.clone(),
+                invited_pilot_id: bob.pilot_id.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_pin.code(), tonic::Code::Unauthenticated);
+
+        let invite_resp = service
+            .portal_invite_to_public_group(Request::new(PortalInviteToPublicGroupRequest {
+                pilot_id: alice.pilot_id.clone(),
+                access_pin: "alicepin123".to_string(),
+                group_id: group.group_id.clone(),
+                invited_pilot_id: bob.pilot_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(invite_resp.group_id, group.group_id);
+        assert_eq!(invite_resp.invited_pilot_id, bob.pilot_id);
+
+        let accept_resp = service
+            .portal_accept_group_invitation(Request::new(PortalAcceptGroupInvitationRequest {
+                pilot_id: bob.pilot_id.clone(),
+                access_pin: "bobpin1234".to_string(),
+                group_id: group.group_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(accept_resp.group_id, group.group_id);
+        assert_eq!(accept_resp.member_pilot_id, bob.pilot_id);
+
+        let leave_bad_pin = service
+            .portal_leave_group(Request::new(PortalLeaveGroupRequest {
+                pilot_id: bob.pilot_id.clone(),
+                access_pin: "wrong".to_string(),
+                group_id: group.group_id.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(leave_bad_pin.code(), tonic::Code::Unauthenticated);
+
+        let leave_resp = service
+            .portal_leave_group(Request::new(PortalLeaveGroupRequest {
+                pilot_id: bob.pilot_id.clone(),
+                access_pin: "bobpin1234".to_string(),
+                group_id: group.group_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(leave_resp.group_id, group.group_id);
+        assert_eq!(leave_resp.member_pilot_id, bob.pilot_id);
 
         ctx.node.close().await;
     }

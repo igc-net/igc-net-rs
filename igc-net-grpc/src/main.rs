@@ -1,7 +1,8 @@
 //! igc-net gRPC service — minimal POC server.
 //!
-//! Exposes FetchArtifact (restricted + public), ProvisionPrivateAccessKey,
-//! and RevokePrivateAccess over gRPC.  Bind address defaults to [::1]:50051.
+//! Exposes pilot registration/auth, flight publication, artifact fetch, index
+//! queries, event snapshots, private-access provisioning/revocation, and node
+//! status over gRPC. Bind address defaults to [::1]:50051.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use clap::Parser;
 use tonic::transport::Server;
 use tracing::info;
 
-use igc_net::{FlatFileStore, IgcIrohNode, PrivateAccessKeyStore, SeqNumStore};
+use igc_net::{FlatFileStore, FollowStore, GroupStore, IgcIrohNode, PrivateAccessKeyStore, SeqNumStore};
 use igc_net_grpc::proto::igc_net_server::IgcNetServer;
 use igc_net_grpc::service::{IgcNetService, NodeContext};
 
@@ -57,11 +58,24 @@ async fn main() -> Result<()> {
         .context("failed to start igc-net node")?;
     let node_id = node.node_id().to_string();
 
+    let group_store = GroupStore::for_data_dir(&data_dir);
+    group_store
+        .init()
+        .context("failed to initialise group store")?;
+
+    let follow_store = FollowStore::for_data_dir(&data_dir);
+    follow_store
+        .init()
+        .context("failed to initialise follow store")?;
+
     let ctx = Arc::new(NodeContext {
         node,
         node_secret_key,
         private_access_key_store: PrivateAccessKeyStore::for_data_dir(&data_dir),
         seq_num_store: SeqNumStore::for_data_dir(&data_dir),
+        group_store,
+        follow_store,
+        group_seq_num_store: SeqNumStore::for_group_fetch_data_dir(&data_dir),
     });
 
     let service = IgcNetService::new(ctx.clone());
