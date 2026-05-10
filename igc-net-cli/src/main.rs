@@ -8,12 +8,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use igc_net::{
-    Blake3Hex, DidKey, FetchPolicy, FlatFileStore, FlightMetadata, GovernanceStore, IgcIrohNode,
-    IndexerConfig, PilotAuthDidRecord, PilotAuthDidStateStatus, PilotKeyStore,
+    Blake3Hex, DeletionRequestRecord, DidKey, FetchPolicy, FlatFileStore, FlightMetadata,
+    GovernanceStore, IgcIrohNode, IndexerConfig, MultiPilotKeyStore, OwnerClaimRecord,
+    PilotAuthDidRecord, PilotAuthDidStateStatus, PilotId, PilotIdentity,
     PilotProfileCredentialRequest, PilotProfileCredentialSubjectDraft,
-    PilotProfileCredentialVerification, PilotProfileCredentialVerifier, SystemClock,
-    announce_topic_id, issue_initial_pilot_auth_did_record, issue_pilot_profile_credential,
-    publish, rotate_pilot_auth_did_record, run_indexer,
+    PilotProfileCredentialVerification, PilotProfileCredentialVerifier, PublicationMode,
+    PublicationModeRecord, SystemClock, announce_topic_id, issue_initial_pilot_auth_did_record,
+    issue_pilot_profile_credential, publish, publish_private, publish_protected,
+    rotate_pilot_auth_did_record, run_indexer,
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -54,8 +56,8 @@ enum Command {
     /// Run an indexer node (Ctrl-C to stop).
     #[command(name = "runindex")]
     RunIndex {
-        /// Fetch policy: metadata-only | eager | geo:<min_lat>,<max_lat>,<min_lon>,<max_lon>
-        #[arg(long, default_value = "metadata-only")]
+        /// Fetch policy: index-only | eager | geo:<min_lat>,<max_lat>,<min_lon>,<max_lon>
+        #[arg(long, default_value = "index-only")]
         policy: String,
 
         /// Comma-separated iroh node IDs (hex-encoded Ed25519 public keys)
@@ -170,6 +172,78 @@ enum Command {
         #[arg(long)]
         expected_audience: Option<String>,
     },
+
+    // ── Publication mode subcommands ──────────────────────────────────────────
+
+    /// Publish a protected flight (sanitized public artifact + raw companion stored locally).
+    #[command(name = "announce-protected")]
+    AnnounceProtected {
+        /// Path to the IGC file to publish.
+        file: PathBuf,
+
+        #[arg(long, default_value = "0")]
+        linger: u64,
+    },
+
+    /// Publish a private flight (raw artifact announced, no public sanitized copy).
+    #[command(name = "announce-private")]
+    AnnouncePrivate {
+        /// Path to the IGC file to publish.
+        file: PathBuf,
+
+        #[arg(long, default_value = "0")]
+        linger: u64,
+    },
+
+    // ── Governance subcommands ────────────────────────────────────────────────
+
+    /// Submit an ownership claim for a flight on the governance topic.
+    #[command(name = "governance-claim")]
+    GovernanceClaim {
+        /// 64-char BLAKE3 hex hash of the flight.
+        igc_hash: String,
+    },
+
+    /// Submit a publication-mode change record for a flight you own.
+    #[command(name = "governance-mode-change")]
+    GovernanceModeChange {
+        /// 64-char BLAKE3 hex hash of the flight.
+        igc_hash: String,
+
+        /// New publication mode: public | protected | private.
+        mode: String,
+
+        /// Required when mode is "protected": 64-char BLAKE3 hex of the sanitized artifact.
+        #[arg(long)]
+        protected_hash: Option<String>,
+
+        /// Optional: record_id of the mode record this supersedes.
+        #[arg(long)]
+        supersedes: Option<String>,
+    },
+
+    /// Submit a deletion request for a flight you own on the governance topic.
+    #[command(name = "governance-delete")]
+    GovernanceDelete {
+        /// 64-char BLAKE3 hex hash of the flight.
+        igc_hash: String,
+    },
+
+    /// Print local governance state for a flight (offline, no node required).
+    #[command(name = "governance-flight-status")]
+    GovernanceFlightStatus {
+        /// 64-char BLAKE3 hex hash of the flight.
+        igc_hash: String,
+    },
+
+    // ── Peer sync subcommands ─────────────────────────────────────────────────
+
+    /// Pull pilot-auth-did governance records for all registered pilots from a peer node.
+    #[command(name = "governance-sync-peer")]
+    GovernanceSyncPeer {
+        /// Hex-encoded Ed25519 public key of the peer node.
+        peer_node_id: String,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -227,6 +301,28 @@ async fn main() -> Result<()> {
             input,
             expected_audience,
         } => cmd_pilot_profile_verify(data_dir, input, expected_audience),
+        Command::AnnounceProtected { file, linger } => {
+            cmd_announce_protected(data_dir, file, linger).await
+        }
+        Command::AnnouncePrivate { file, linger } => {
+            cmd_announce_private(data_dir, file, linger).await
+        }
+        Command::GovernanceClaim { igc_hash } => cmd_governance_claim(data_dir, igc_hash).await,
+        Command::GovernanceModeChange {
+            igc_hash,
+            mode,
+            protected_hash,
+            supersedes,
+        } => cmd_governance_mode_change(data_dir, igc_hash, mode, protected_hash, supersedes).await,
+        Command::GovernanceDelete { igc_hash } => {
+            cmd_governance_delete(data_dir, igc_hash).await
+        }
+        Command::GovernanceFlightStatus { igc_hash } => {
+            cmd_governance_flight_status(data_dir, igc_hash)
+        }
+        Command::GovernanceSyncPeer { peer_node_id } => {
+            cmd_governance_sync_peer(data_dir, peer_node_id).await
+        }
     }
 }
 
@@ -398,39 +494,34 @@ fn cmd_pilot_auth_status(data_dir: PathBuf) -> Result<()> {
 
 fn pilot_auth_status_json(data_dir: &std::path::Path) -> Result<serde_json::Value> {
     let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
-    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
-    pilot_keys.init()?;
+    let (pilot_keys, pilot_id, identity) =
+        load_single_registered_pilot(data_dir, &node_secret_key)?;
     let governance = GovernanceStore::for_data_dir(&data_dir);
     governance.init()?;
 
-    let key_status = pilot_keys.inspect()?;
     let archived_pilot_auth_dids = pilot_keys.archived_pilot_auth_dids()?;
-    let public_identity = pilot_keys.export_public_identity(&node_secret_key)?;
-    let governance_state = match &public_identity {
-        Some(identity) => Some(governance.resolve_pilot_auth_did_state(&identity.pilot_id)?),
-        None => None,
-    };
+    let public_identity = identity.export_public_identity();
+    let governance_state = governance.resolve_pilot_auth_did_state(&pilot_id)?;
 
     Ok(serde_json::json!({
-        "key_store": key_status,
+        "pilot_id": pilot_id,
         "archived_pilot_auth_dids": archived_pilot_auth_dids,
         "public_identity": public_identity,
-        "governance_state": governance_state.as_ref().map(|state| serde_json::json!({
-            "status": pilot_auth_state_status_label(state.status()),
-            "authoritative": state.authoritative,
-            "tentative_record_ids": state.tentative_record_ids,
-        })),
+        "governance_state": {
+            "status": pilot_auth_state_status_label(governance_state.status()),
+            "authoritative": governance_state.authoritative,
+            "tentative_record_ids": governance_state.tentative_record_ids,
+        },
     }))
 }
 
 fn cmd_pilot_auth_issue_initial(data_dir: PathBuf, created_at: Option<String>) -> Result<()> {
     let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
-    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
-    pilot_keys.init()?;
+    let (_pilot_keys, _pilot_id, identity) =
+        load_single_registered_pilot(&data_dir, &node_secret_key)?;
     let governance = GovernanceStore::for_data_dir(&data_dir);
     governance.init()?;
 
-    let identity = pilot_keys.load_or_generate(&node_secret_key)?;
     let record = issue_initial_pilot_auth_did_record(
         &governance,
         &identity,
@@ -490,14 +581,11 @@ fn cmd_pilot_profile_verify(
 
 fn cmd_pilot_auth_rotate(data_dir: PathBuf, created_at: Option<String>) -> Result<()> {
     let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
-    let pilot_keys = PilotKeyStore::for_data_dir(&data_dir);
-    pilot_keys.init()?;
+    let (pilot_keys, _pilot_id, current_identity) =
+        load_single_registered_pilot(&data_dir, &node_secret_key)?;
     let governance = GovernanceStore::for_data_dir(&data_dir);
     governance.init()?;
 
-    let current_identity = pilot_keys
-        .load(&node_secret_key)?
-        .context("pilot identity is not initialized; issue the initial record first")?;
     let next_active_pilot_auth_secret_key =
         pilot_keys.generate_next_active_pilot_auth_secret_key(&node_secret_key)?;
     let record = rotate_pilot_auth_did_record(
@@ -564,14 +652,10 @@ fn issue_pilot_profile_jwt<C: igc_net::Clock>(
     clock: &C,
 ) -> Result<IssuedPilotProfileCredential> {
     let node_secret_key = load_or_generate_node_secret_key(data_dir)?;
-    let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
-    pilot_keys.init()?;
+    let (_pilot_keys, _pilot_id, identity) =
+        load_single_registered_pilot(data_dir, &node_secret_key)?;
     let governance = GovernanceStore::for_data_dir(data_dir);
     governance.init()?;
-
-    let identity = pilot_keys.load(&node_secret_key)?.context(
-        "pilot identity is not initialized; issue the initial pilot-auth-did record first",
-    )?;
 
     let request = PilotProfileCredentialRequest {
         subject: PilotProfileCredentialSubjectDraft {
@@ -647,6 +731,29 @@ fn load_text_input(input: &str) -> Result<String> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn load_single_registered_pilot(
+    data_dir: &std::path::Path,
+    node_secret_key: &iroh::SecretKey,
+) -> Result<(igc_net::PilotKeyStore, PilotId, PilotIdentity)> {
+    let multi_pilot_keys = MultiPilotKeyStore::for_data_dir(data_dir);
+    multi_pilot_keys.init()?;
+    let pilots = multi_pilot_keys.list_pilots(node_secret_key)?;
+    let pilot = match pilots.as_slice() {
+        [] => {
+            anyhow::bail!("no registered pilot found; register a pilot before using this command")
+        }
+        [pilot] => pilot,
+        _ => anyhow::bail!(
+            "multiple registered pilots found; this CLI command requires an explicit pilot selection flow"
+        ),
+    };
+    let pilot_id = pilot.pilot_id.clone();
+    let identity = multi_pilot_keys
+        .load_pilot(&pilot_id, node_secret_key)?
+        .context("registered pilot identity is missing")?;
+    Ok((multi_pilot_keys.pilot_store(&pilot_id), pilot_id, identity))
+}
+
 fn resolve_data_dir(opt: Option<PathBuf>) -> Result<PathBuf> {
     // Check env var first
     if let Some(p) = opt {
@@ -703,9 +810,201 @@ fn parse_endpoint_addr(s: &str) -> Result<iroh::EndpointAddr> {
     Ok(iroh::EndpointAddr::new(node_id).with_ip_addr(socket_addr))
 }
 
+fn parse_publication_mode(s: &str) -> Result<PublicationMode> {
+    match s {
+        "public" => Ok(PublicationMode::Public),
+        "protected" => Ok(PublicationMode::Protected),
+        "private" => Ok(PublicationMode::Private),
+        _ => anyhow::bail!("unknown mode {s:?}; use public, protected, or private"),
+    }
+}
+
+/// `igc-net announce-protected <file.igc> [--linger <secs>]`
+async fn cmd_announce_protected(data_dir: PathBuf, file: PathBuf, linger: u64) -> Result<()> {
+    let bytes = std::fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+    let node = IgcIrohNode::start(&data_dir).await?;
+    eprintln!("node_addr: {}", node.loopback_addr_str()?);
+    if linger > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let result = publish_protected(&node, bytes).await?;
+    println!("raw_igc_hash:         {}", result.raw_igc_hash);
+    println!("protected_hash:       {}", result.protected_hash);
+    println!("protected_ticket:     {}", result.protected_ticket);
+    println!("raw_companion_ticket: {}", result.raw_companion_ticket);
+    println!("g_record_present:     {}", result.g_record_present);
+    if linger > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(linger)).await;
+    }
+    node.close().await;
+    Ok(())
+}
+
+/// `igc-net announce-private <file.igc> [--linger <secs>]`
+async fn cmd_announce_private(data_dir: PathBuf, file: PathBuf, linger: u64) -> Result<()> {
+    let bytes = std::fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+    let node = IgcIrohNode::start(&data_dir).await?;
+    eprintln!("node_addr: {}", node.loopback_addr_str()?);
+    if linger > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let result = publish_private(&node, bytes).await?;
+    println!("raw_igc_hash:     {}", result.raw_igc_hash);
+    println!("raw_igc_ticket:   {}", result.raw_igc_ticket);
+    println!("g_record_present: {}", result.g_record_present);
+    if linger > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(linger)).await;
+    }
+    node.close().await;
+    Ok(())
+}
+
+/// `igc-net governance-claim <igc_hash>`
+async fn cmd_governance_claim(data_dir: PathBuf, igc_hash_str: String) -> Result<()> {
+    let igc_hash = igc_hash_str
+        .parse::<Blake3Hex>()
+        .with_context(|| format!("invalid igc_hash: {igc_hash_str:?}"))?;
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let (_, _, identity) = load_single_registered_pilot(&data_dir, &node_secret_key)?;
+    let node = IgcIrohNode::start(&data_dir).await?;
+    let record = OwnerClaimRecord::issue(
+        &identity.pilot_id_secret_key(),
+        igc_hash,
+        canonical_utc_now(),
+        Vec::new(),
+    )?;
+    node.governance_store().persist_owner_claim_record(&record)?;
+    node.broadcast_governance_record(&record).await?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    node.close().await;
+    Ok(())
+}
+
+/// `igc-net governance-mode-change <igc_hash> <mode> [--protected-hash <hex>] [--supersedes <id>]`
+async fn cmd_governance_mode_change(
+    data_dir: PathBuf,
+    igc_hash_str: String,
+    mode_str: String,
+    protected_hash_str: Option<String>,
+    supersedes_str: Option<String>,
+) -> Result<()> {
+    let igc_hash = igc_hash_str
+        .parse::<Blake3Hex>()
+        .with_context(|| format!("invalid igc_hash: {igc_hash_str:?}"))?;
+    let mode = parse_publication_mode(&mode_str)?;
+    let protected_hash = protected_hash_str
+        .map(|s| {
+            s.parse::<Blake3Hex>()
+                .with_context(|| format!("invalid --protected-hash: {s:?}"))
+        })
+        .transpose()?;
+    let supersedes = supersedes_str
+        .map(|s| {
+            s.parse::<Blake3Hex>()
+                .with_context(|| format!("invalid --supersedes: {s:?}"))
+        })
+        .transpose()?;
+
+    if matches!(mode, PublicationMode::Protected) && protected_hash.is_none() {
+        anyhow::bail!("--protected-hash <hex> is required when mode is \"protected\"");
+    }
+
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let (_, _, identity) = load_single_registered_pilot(&data_dir, &node_secret_key)?;
+    let node = IgcIrohNode::start(&data_dir).await?;
+    let record = PublicationModeRecord::issue(
+        &identity.pilot_id_secret_key(),
+        igc_hash,
+        mode,
+        protected_hash,
+        supersedes,
+        canonical_utc_now(),
+    )?;
+    node.governance_store()
+        .persist_publication_mode_record(&record)?;
+    node.broadcast_governance_record(&record).await?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    node.close().await;
+    Ok(())
+}
+
+/// `igc-net governance-delete <igc_hash>`
+async fn cmd_governance_delete(data_dir: PathBuf, igc_hash_str: String) -> Result<()> {
+    let igc_hash = igc_hash_str
+        .parse::<Blake3Hex>()
+        .with_context(|| format!("invalid igc_hash: {igc_hash_str:?}"))?;
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let (_, _, identity) = load_single_registered_pilot(&data_dir, &node_secret_key)?;
+    let node = IgcIrohNode::start(&data_dir).await?;
+    let record = DeletionRequestRecord::issue(
+        &identity.pilot_id_secret_key(),
+        igc_hash,
+        canonical_utc_now(),
+    )?;
+    node.governance_store()
+        .persist_deletion_request_record(&record)?;
+    node.broadcast_governance_record(&record).await?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    node.close().await;
+    Ok(())
+}
+
+/// `igc-net governance-flight-status <igc_hash>`
+fn cmd_governance_flight_status(data_dir: PathBuf, igc_hash_str: String) -> Result<()> {
+    let igc_hash = igc_hash_str
+        .parse::<Blake3Hex>()
+        .with_context(|| format!("invalid igc_hash: {igc_hash_str:?}"))?;
+    let governance = GovernanceStore::for_data_dir(&data_dir);
+    governance.init()?;
+    let output = match governance.resolve_flight_governance_state(&igc_hash)? {
+        Some(state) => serde_json::to_value(&state)?,
+        None => serde_json::json!({ "status": "unknown" }),
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// `igc-net governance-sync-peer <peer_node_id>`
+async fn cmd_governance_sync_peer(data_dir: PathBuf, peer_node_id_str: String) -> Result<()> {
+    let peer: iroh::PublicKey = peer_node_id_str
+        .parse()
+        .with_context(|| format!("invalid peer node ID: {peer_node_id_str:?}"))?;
+    let node_secret_key = load_or_generate_node_secret_key(&data_dir)?;
+    let multi_pilot_keys = MultiPilotKeyStore::for_data_dir(&data_dir);
+    multi_pilot_keys.init()?;
+    let pilots = multi_pilot_keys.list_pilots(&node_secret_key)?;
+    anyhow::ensure!(
+        !pilots.is_empty(),
+        "no registered pilots; register a pilot before syncing"
+    );
+    let node = IgcIrohNode::start(&data_dir).await?;
+    let mut total_synced = 0usize;
+    for pilot_info in &pilots {
+        let synced = node
+            .sync_pilot_auth_did_from_peer(peer, &pilot_info.pilot_id)
+            .await
+            .with_context(|| format!("sync failed for pilot {}", pilot_info.pilot_id))?;
+        eprintln!(
+            "pilot {}: {} record(s) synced",
+            pilot_info.pilot_id, synced
+        );
+        total_synced += synced;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "peer": peer_node_id_str,
+            "pilots_synced": pilots.len(),
+            "total_records_synced": total_synced,
+        }))?
+    );
+    node.close().await;
+    Ok(())
+}
+
 fn parse_policy(s: &str) -> Result<FetchPolicy> {
     match s {
-        "metadata-only" | "metadata_only" => Ok(FetchPolicy::MetadataOnly),
+        "index-only" => Ok(FetchPolicy::IndexOnly),
         "eager" => Ok(FetchPolicy::Eager),
         _ if s.starts_with("geo:") => {
             let parts: Vec<&str> = s[4..].split(',').collect();
@@ -721,7 +1020,7 @@ fn parse_policy(s: &str) -> Result<FetchPolicy> {
                 max_lon: p(parts[3])?,
             })
         }
-        _ => anyhow::bail!("unknown policy {s:?}; use metadata-only, eager, or geo:<bbox>"),
+        _ => anyhow::bail!("unknown policy {s:?}; use index-only, eager, or geo:<bbox>"),
     }
 }
 
@@ -775,12 +1074,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path();
         let node_secret_key = load_or_generate_node_secret_key(data_dir).unwrap();
-        let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
-        pilot_keys.init().unwrap();
+        let multi_pilot_keys = MultiPilotKeyStore::for_data_dir(data_dir);
+        multi_pilot_keys.init().unwrap();
         let governance = GovernanceStore::for_data_dir(data_dir);
         governance.init().unwrap();
 
-        let identity = pilot_keys.load_or_generate(&node_secret_key).unwrap();
+        let identity = multi_pilot_keys
+            .generate_pilot("Alice Example", Some("NO".to_string()), &node_secret_key)
+            .unwrap();
+        let pilot_keys = multi_pilot_keys.pilot_store(&identity.pilot_id());
         let initial =
             issue_initial_pilot_auth_did_record(&governance, &identity, "2026-05-01T09:14:00Z")
                 .unwrap();
@@ -837,12 +1139,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path();
         let node_secret_key = load_or_generate_node_secret_key(data_dir).unwrap();
-        let pilot_keys = PilotKeyStore::for_data_dir(data_dir);
-        pilot_keys.init().unwrap();
+        let multi_pilot_keys = MultiPilotKeyStore::for_data_dir(data_dir);
+        multi_pilot_keys.init().unwrap();
         let governance = GovernanceStore::for_data_dir(data_dir);
         governance.init().unwrap();
 
-        let identity = pilot_keys.load_or_generate(&node_secret_key).unwrap();
+        let identity = multi_pilot_keys
+            .generate_pilot("Alice Example", Some("NO".to_string()), &node_secret_key)
+            .unwrap();
+        let pilot_keys = multi_pilot_keys.pilot_store(&identity.pilot_id());
         let initial =
             issue_initial_pilot_auth_did_record(&governance, &identity, "2026-05-01T09:14:00Z")
                 .unwrap();
