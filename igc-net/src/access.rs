@@ -12,7 +12,10 @@ use crate::util::is_lower_hex_64;
 
 const FETCH_REQUEST_SCHEMA: &str = "igc-net/fetch-request";
 const FETCH_REQUEST_SCHEMA_VERSION: u32 = 1;
+const GROUP_FETCH_REQUEST_SCHEMA: &str = "igc-net/group-fetch-request";
+const GROUP_FETCH_REQUEST_SCHEMA_VERSION: u32 = 1;
 const SEQ_NUM_DIRNAME: &str = "seq-nums";
+const GROUP_SEQ_NUM_DIRNAME: &str = "seq-nums-group";
 
 // ── ArtifactClass ─────────────────────────────────────────────────────────────
 
@@ -193,6 +196,176 @@ fn decode_signature_hex(value: &str) -> Result<iroh::Signature, FetchProofError>
     Ok(iroh::Signature::from_bytes(&sig_bytes))
 }
 
+// ── GroupFetchProof ───────────────────────────────────────────────────────────
+
+/// Signed group-based fetch proof.  The requester proves membership via their
+/// root pilot identity key (the pubkey embedded in `requester_pilot_id`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupFetchProof {
+    pub schema: String,
+    pub schema_version: u32,
+    pub raw_igc_hash: String,
+    pub artifact_class: ArtifactClass,
+    pub requester_pilot_id: String,
+    pub group_id: String,
+    pub seq_num: u64,
+    pub signature: String,
+}
+
+/// Payload signed by the requester — all `GroupFetchProof` fields except `signature`.
+#[derive(Serialize)]
+struct GroupFetchProofPayload<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    raw_igc_hash: &'a str,
+    artifact_class: &'a ArtifactClass,
+    requester_pilot_id: &'a str,
+    group_id: &'a str,
+    seq_num: u64,
+}
+
+// ── GroupFetchProofError ──────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum GroupFetchProofError {
+    #[error("JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("raw_igc_hash must be 64 lowercase hex chars")]
+    InvalidHash,
+    #[error("seq_num must be ≥ 1")]
+    SeqNumZero,
+    #[error("signature must be 128 lowercase hex chars")]
+    InvalidSignatureEncoding,
+    #[error("requester_pilot_id is not a valid PilotId (expected igcnet:id:<64-hex>)")]
+    InvalidRequesterPilotId,
+    #[error("group_id is not a valid GroupId (expected igcnet:group:<32-hex>)")]
+    InvalidGroupId,
+    #[error("signature verification failed")]
+    SignatureVerification,
+    #[error("signed artifact_class does not match the expected artifact class")]
+    ArtifactClassMismatch,
+    #[error("seq_num {got} is not strictly greater than last seen {last_seen}")]
+    SeqNumNotMonotonic { got: u64, last_seen: u64 },
+}
+
+// ── Signing ───────────────────────────────────────────────────────────────────
+
+/// Build and sign a group-based fetch proof using the pilot's root identity key.
+pub fn sign_group_fetch_proof(
+    raw_igc_hash: &str,
+    artifact_class: ArtifactClass,
+    requester_pilot_id: &str,
+    group_id: &str,
+    seq_num: u64,
+    pilot_root_secret_key: &iroh::SecretKey,
+) -> Result<GroupFetchProof, GroupFetchProofError> {
+    if !is_lower_hex_64(raw_igc_hash) {
+        return Err(GroupFetchProofError::InvalidHash);
+    }
+    if seq_num == 0 {
+        return Err(GroupFetchProofError::SeqNumZero);
+    }
+    parse_pilot_id(requester_pilot_id)?;
+    parse_group_id(group_id)?;
+
+    let payload = GroupFetchProofPayload {
+        schema: GROUP_FETCH_REQUEST_SCHEMA,
+        schema_version: GROUP_FETCH_REQUEST_SCHEMA_VERSION,
+        raw_igc_hash,
+        artifact_class: &artifact_class,
+        requester_pilot_id,
+        group_id,
+        seq_num,
+    };
+    let signing_bytes = json_canon::to_vec(&payload)?;
+    let signature = hex::encode(pilot_root_secret_key.sign(&signing_bytes).to_bytes());
+
+    Ok(GroupFetchProof {
+        schema: GROUP_FETCH_REQUEST_SCHEMA.to_string(),
+        schema_version: GROUP_FETCH_REQUEST_SCHEMA_VERSION,
+        raw_igc_hash: raw_igc_hash.to_string(),
+        artifact_class,
+        requester_pilot_id: requester_pilot_id.to_string(),
+        group_id: group_id.to_string(),
+        seq_num,
+        signature,
+    })
+}
+
+// ── Verification ──────────────────────────────────────────────────────────────
+
+/// Verify a group-fetch proof received by a serving node.
+///
+/// Checks (in order):
+/// 1. `requester_pilot_id` is a valid PilotId
+/// 2. `artifact_class` matches `expected_artifact_class`
+/// 3. `seq_num ≥ 1` and `seq_num > last_seen_seq_num`
+/// 4. Ed25519 signature is valid (pubkey extracted from `requester_pilot_id`)
+pub fn verify_group_fetch_proof(
+    proof: &GroupFetchProof,
+    expected_artifact_class: &ArtifactClass,
+    last_seen_seq_num: u64,
+) -> Result<(), GroupFetchProofError> {
+    let authorized_public_key = parse_pilot_id(&proof.requester_pilot_id)?;
+    parse_group_id(&proof.group_id)?;
+
+    if &proof.artifact_class != expected_artifact_class {
+        return Err(GroupFetchProofError::ArtifactClassMismatch);
+    }
+    if proof.seq_num == 0 {
+        return Err(GroupFetchProofError::SeqNumZero);
+    }
+    if proof.seq_num <= last_seen_seq_num {
+        return Err(GroupFetchProofError::SeqNumNotMonotonic {
+            got: proof.seq_num,
+            last_seen: last_seen_seq_num,
+        });
+    }
+    if !is_lower_hex_64(&proof.raw_igc_hash) {
+        return Err(GroupFetchProofError::InvalidHash);
+    }
+
+    let signature = decode_signature_hex(&proof.signature)
+        .map_err(|_| GroupFetchProofError::InvalidSignatureEncoding)?;
+    let payload = GroupFetchProofPayload {
+        schema: GROUP_FETCH_REQUEST_SCHEMA,
+        schema_version: GROUP_FETCH_REQUEST_SCHEMA_VERSION,
+        raw_igc_hash: &proof.raw_igc_hash,
+        artifact_class: &proof.artifact_class,
+        requester_pilot_id: &proof.requester_pilot_id,
+        group_id: &proof.group_id,
+        seq_num: proof.seq_num,
+    };
+    let signing_bytes = json_canon::to_vec(&payload)?;
+    authorized_public_key
+        .verify(&signing_bytes, &signature)
+        .map_err(|_| GroupFetchProofError::SignatureVerification)?;
+
+    Ok(())
+}
+
+fn parse_pilot_id(pilot_id: &str) -> Result<iroh::PublicKey, GroupFetchProofError> {
+    let key_hex = pilot_id
+        .strip_prefix("igcnet:id:")
+        .filter(|h| is_lower_hex_64(h))
+        .ok_or(GroupFetchProofError::InvalidRequesterPilotId)?;
+    let bytes = hex::decode(key_hex).map_err(|_| GroupFetchProofError::InvalidRequesterPilotId)?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| GroupFetchProofError::InvalidRequesterPilotId)?;
+    iroh::PublicKey::from_bytes(&arr).map_err(|_| GroupFetchProofError::InvalidRequesterPilotId)
+}
+
+fn parse_group_id(group_id: &str) -> Result<(), GroupFetchProofError> {
+    let id_hex = group_id
+        .strip_prefix("igcnet:group:")
+        .ok_or(GroupFetchProofError::InvalidGroupId)?;
+    if id_hex.len() != 32 || !id_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(GroupFetchProofError::InvalidGroupId);
+    }
+    Ok(())
+}
+
 // ── SeqNumStore ───────────────────────────────────────────────────────────────
 
 /// Server-side durable store for the last-accepted `seq_num` per requester key.
@@ -226,6 +399,10 @@ impl SeqNumStore {
 
     pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
         Self::open(data_dir.as_ref().join(SEQ_NUM_DIRNAME))
+    }
+
+    pub fn for_group_fetch_data_dir(data_dir: impl AsRef<Path>) -> Self {
+        Self::open(data_dir.as_ref().join(GROUP_SEQ_NUM_DIRNAME))
     }
 
     /// Return the last accepted `seq_num` for this requester key, or `0` if

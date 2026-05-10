@@ -38,6 +38,7 @@ ed25519-dalek.workspace = true
 json_canon.workspace  = true
 reqwest = { workspace = true, optional = true }
 zeroize.workspace = true
+argon2.workspace = true
 
 [dev-dependencies]
 tempfile             = { workspace = true }

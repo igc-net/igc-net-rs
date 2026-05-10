@@ -113,6 +113,8 @@ pub enum IdentifierError {
     NodeIdHex(String),
     #[error("invalid pilot ID (expected igcnet:id:<64 lowercase hex chars>): {0:?}")]
     PilotId(String),
+    #[error("invalid group ID (expected igcnet:group:<32 lowercase hex chars>): {0:?}")]
+    GroupId(String),
 }
 
 declare_identifier! {
@@ -153,6 +155,56 @@ declare_identifier! {
 
 declare_identifier! {
     #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub struct GroupId;
+    parse(value) {
+        if let Some(id_hex) = value.strip_prefix(Self::PREFIX)
+            && id_hex.len() == 32
+            && id_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(IdentifierError::GroupId(value))
+        }
+    }
+
+    pub const PREFIX: &str = "igcnet:group:";
+
+    pub fn id_hex(&self) -> &str {
+        self.0.strip_prefix(Self::PREFIX).expect("validated group_id prefix")
+    }
+
+    pub fn derive(
+        group_type: &crate::group::GroupType,
+        creator_pilot_id: &PilotId,
+        name: &Option<String>,
+        created_at: &str,
+    ) -> Result<Self, serde_json::Error> {
+        #[derive(serde::Serialize)]
+        struct DerivePayload<'a> {
+            schema: &'static str,
+            schema_version: u8,
+            group_type: &'a crate::group::GroupType,
+            creator_pilot_id: &'a PilotId,
+            name: &'a Option<String>,
+            created_at: &'a str,
+        }
+        let payload = DerivePayload {
+            schema: "igc-net/group-creation",
+            schema_version: 1,
+            group_type,
+            creator_pilot_id,
+            name,
+            created_at,
+        };
+        let canonical = json_canon::to_vec(&payload)?;
+        let hash = blake3::hash(&canonical);
+        let hex = hex::encode(&hash.as_bytes()[..16]);
+        Ok(Self(format!("{}{}", Self::PREFIX, hex)))
+    }
+}
+
+declare_identifier! {
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub struct PilotId;
     parse(value) {
         if let Some(key_hex) = value.strip_prefix(Self::PREFIX)
@@ -174,5 +226,67 @@ declare_identifier! {
 
     pub fn from_public_key(key: iroh::PublicKey) -> Self {
         Self(format!("{}{}", Self::PREFIX, key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::group::GroupType;
+
+    fn pilot(byte: u8) -> PilotId {
+        PilotId::from_public_key(iroh::SecretKey::from_bytes(&[byte; 32]).public())
+    }
+
+    #[test]
+    fn group_id_derive_has_correct_prefix_and_hex_length() {
+        let id = GroupId::derive(&GroupType::Private, &pilot(1), &None, "2026-01-01T12:00:00Z").unwrap();
+        assert!(id.as_str().starts_with(GroupId::PREFIX));
+        assert_eq!(id.id_hex().len(), 32);
+        assert!(id.id_hex().bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
+    fn group_id_derive_is_deterministic() {
+        let creator = pilot(1);
+        let name = Some("My Club".to_string());
+        let ts = "2026-01-01T12:00:00Z";
+        let id1 = GroupId::derive(&GroupType::Private, &creator, &name, ts).unwrap();
+        let id2 = GroupId::derive(&GroupType::Private, &creator, &name, ts).unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn group_id_derive_differs_by_created_at() {
+        let creator = pilot(1);
+        let id1 = GroupId::derive(&GroupType::Private, &creator, &None, "2026-01-01T12:00:00Z").unwrap();
+        let id2 = GroupId::derive(&GroupType::Private, &creator, &None, "2026-01-01T12:00:01Z").unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn group_id_derive_differs_by_group_type() {
+        let creator = pilot(1);
+        let ts = "2026-01-01T12:00:00Z";
+        let id_private = GroupId::derive(&GroupType::Private, &creator, &None, ts).unwrap();
+        let id_public = GroupId::derive(&GroupType::Public, &creator, &None, ts).unwrap();
+        assert_ne!(id_private, id_public);
+    }
+
+    #[test]
+    fn group_id_derive_differs_by_creator() {
+        let ts = "2026-01-01T12:00:00Z";
+        let id1 = GroupId::derive(&GroupType::Private, &pilot(1), &None, ts).unwrap();
+        let id2 = GroupId::derive(&GroupType::Private, &pilot(2), &None, ts).unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn group_id_derive_differs_by_name() {
+        let creator = pilot(1);
+        let ts = "2026-01-01T12:00:00Z";
+        let id_unnamed = GroupId::derive(&GroupType::Private, &creator, &None, ts).unwrap();
+        let id_named = GroupId::derive(&GroupType::Private, &creator, &Some("Club".to_string()), ts).unwrap();
+        assert_ne!(id_unnamed, id_named);
     }
 }

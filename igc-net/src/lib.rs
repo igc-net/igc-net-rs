@@ -1,7 +1,13 @@
 pub mod access;
+pub(crate) mod artifact_announcement;
+pub mod follow;
+pub mod follow_store;
 pub mod governance;
+pub mod group;
+pub mod group_store;
 pub mod id;
 pub mod identity;
+pub mod igc;
 pub mod indexer;
 pub mod keys;
 pub mod metadata;
@@ -13,9 +19,18 @@ pub(crate) mod util;
 pub mod verify;
 
 pub use access::{
-    ArtifactClass, FetchProof, FetchProofError, SeqNumStore, SeqNumStoreError, sign_fetch_proof,
-    verify_fetch_proof,
+    ArtifactClass, FetchProof, FetchProofError, GroupFetchProof, GroupFetchProofError, SeqNumStore,
+    SeqNumStoreError, sign_fetch_proof, sign_group_fetch_proof, verify_fetch_proof,
+    verify_group_fetch_proof,
 };
+pub use follow::{FollowRecord, FollowRecordError, UnfollowRecord};
+pub use follow_store::{FollowStore, FollowStoreError};
+pub use group::{
+    GroupCreationRecord, GroupRecordError, GroupType, PrivateGroupMemberAddRecord,
+    PrivateGroupMemberRemoveRecord, PublicGroupAcceptRecord, PublicGroupInviteRecord,
+    PublicGroupLeaveRecord,
+};
+pub use group_store::{GroupMembership, GroupStore, GroupStoreError};
 pub use governance::{
     ClaimApprovalRecord, ClaimChallengeRecord, ClaimResolutionOutcome, ClaimResolutionRecord,
     DeletionRequestRecord, FlightGovernanceRecordError, FlightGovernanceState,
@@ -28,7 +43,7 @@ pub use governance::{
     PrivateAccessRotationStateStatus, PublicationModeRecord, ResolverProfile, RosterUpdateAction,
     RosterUpdateRecord, issue_initial_pilot_auth_did_record, rotate_pilot_auth_did_record,
 };
-pub use id::{Blake3Hex, IdentifierError, NodeIdHex, PilotId};
+pub use id::{Blake3Hex, GroupId, IdentifierError, NodeIdHex, PilotId};
 #[cfg(feature = "did-web")]
 pub use identity::ReqwestDidWebResolver;
 pub use identity::{
@@ -39,10 +54,12 @@ pub use identity::{
     PilotProfileCredentialSubjectDraft, PilotProfileCredentialVc, ResolvedDidWebVerificationMethod,
     SystemClock, issue_pilot_profile_credential, verify_pilot_profile_credential,
 };
+pub use igc::g_record_present;
 pub use indexer::{FetchPolicy, IndexerConfig, IndexerError, RateLimitConfig, run_indexer};
 pub use keys::{
-    PilotIdentity, PilotKeyStore, PilotKeyStoreError, PilotKeyStoreStatus, PilotPublicIdentity,
-    PrivateAccessKeyStore,
+    MultiPilotKeyStore, PilotCredentialFile, PilotCredentialStore, PilotIdentity, PilotKeyStore,
+    PilotKeyStoreError, PilotKeyStoreStatus, PilotProfile, PilotPublicIdentity,
+    PilotPublicIdentityWithProfile, PrivateAccessKeyStore,
 };
 pub use metadata::{BoundingBox, FlightMetadata, MetadataError};
 pub use node::{IgcIrohNode, NodeError};
