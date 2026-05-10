@@ -103,6 +103,9 @@ pub struct ArtifactRegistryRecord {
     pub has_protected_raw_companion: bool,
     /// Serving nodes currently known for this flight identity.
     pub serving_node_ids: Vec<NodeIdHex>,
+    /// Whether the raw IGC bytes are known to contain at least one G-record.
+    #[serde(default)]
+    pub g_record_present: Option<bool>,
     /// Local event timestamp for this registry update.
     pub recorded_at: String,
 }
@@ -936,6 +939,7 @@ mod tests {
             has_protected_sanitized_igc: true,
             has_protected_raw_companion: true,
             serving_node_ids: vec![node_id('d')],
+            g_record_present: None,
             recorded_at: "2026-04-28T12:00:00Z".to_string(),
         };
         store
@@ -970,6 +974,7 @@ mod tests {
             has_protected_sanitized_igc: false,
             has_protected_raw_companion: false,
             serving_node_ids: vec![node_id('b')],
+            g_record_present: None,
             recorded_at: "2026-05-01T09:00:00Z".to_string(),
         };
         let second = ArtifactRegistryRecord {
@@ -981,6 +986,7 @@ mod tests {
             has_protected_sanitized_igc: false,
             has_protected_raw_companion: false,
             serving_node_ids: vec![node_id('d')],
+            g_record_present: None,
             recorded_at: "2026-05-01T09:01:00Z".to_string(),
         };
 
@@ -1023,6 +1029,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![node_id('b')],
+                g_record_present: None,
                 recorded_at: "2026-04-28T12:00:00Z".to_string(),
             })
             .await
@@ -1037,6 +1044,7 @@ mod tests {
                 has_protected_sanitized_igc: false,
                 has_protected_raw_companion: false,
                 serving_node_ids: vec![node_id('b'), node_id('d')],
+                g_record_present: None,
                 recorded_at: "2026-04-28T12:01:00Z".to_string(),
             })
             .await
@@ -1060,6 +1068,7 @@ mod tests {
             has_protected_sanitized_igc: true,
             has_protected_raw_companion: false,
             serving_node_ids: vec![],
+            g_record_present: None,
             recorded_at: "2026-04-28T12:00:00Z".to_string(),
         };
         assert!(matches!(
@@ -1080,6 +1089,7 @@ mod tests {
             has_protected_sanitized_igc: false,
             has_protected_raw_companion: false,
             serving_node_ids: vec![],
+            g_record_present: None,
             recorded_at: "2026-04-28T12:00:00Z".to_string(),
         };
         assert!(matches!(

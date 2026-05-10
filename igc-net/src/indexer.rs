@@ -11,17 +11,13 @@ use iroh_gossip::TopicId;
 use iroh_gossip::api::Event;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::artifact_announcement::ArtifactAnnouncement;
 use crate::id::{Blake3Hex, NodeIdHex};
-use crate::metadata::FlightMetadata;
+use crate::igc::g_record_present;
 use crate::node::IgcIrohNode;
-use crate::store::{
-    ArtifactRegistryRecord, FlatFileStore, IndexRecord, IndexRecordSource, PublicationMode,
-};
+use crate::store::{ArtifactRegistryRecord, FlatFileStore, PublicationMode};
 use crate::topic::announce_topic_id;
 use crate::util::canonical_utc_now;
-
-const ARTIFACT_ANNOUNCEMENT_SCHEMA: &str = "igc-net/announcement";
-const ARTIFACT_ANNOUNCEMENT_VERSION: u8 = 1;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -37,64 +33,10 @@ pub enum IndexerError {
     BlobRead(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AnnouncementError {
-    #[error("JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("announcement exceeds 1024-byte limit: {0} bytes")]
-    TooLarge(usize),
-    #[error("invalid {ticket} ticket: {message}")]
-    InvalidTicket {
-        ticket: &'static str,
-        message: String,
-    },
-    #[error("{ticket} ticket hash mismatch")]
-    TicketHashMismatch { ticket: &'static str },
-    #[error("{ticket} ticket node mismatch")]
-    TicketNodeMismatch { ticket: &'static str },
-    #[error("metadata JSON: {0}")]
-    MetadataJson(serde_json::Error),
-    #[error("metadata: {0}")]
-    Metadata(#[from] crate::metadata::MetadataError),
-    #[error("metadata igc_hash mismatch")]
-    MetadataIgcHashMismatch,
-    #[error("meta_hash mismatch")]
-    MetaHashMismatch,
-    #[error("igc_hash mismatch")]
-    IgcHashMismatch,
-    #[error("unsupported announcement schema: {0}")]
-    UnsupportedSchema(String),
-    #[error("schema_version is unsupported: {0}")]
-    UnsupportedVersion(u8),
-    #[error("record_id mismatch")]
-    RecordIdMismatch,
-    #[error("signature verification failed")]
-    SignatureVerification,
-    #[error("signature must be 128 lowercase hex chars")]
-    SignatureEncoding,
-    #[error("announcement tickets are required")]
-    MissingTickets,
-    #[error("protected_hash presence does not match publication_mode")]
-    ProtectedHashPresence,
-    #[error("companion_tickets presence does not match publication_mode")]
-    CompanionTicketPresence,
-}
-
 #[derive(Debug)]
 enum AnnouncementDisposition {
     Ignored(String),
     Indexed { fetched_igc: bool },
-}
-
-struct ValidatedAnnouncement {
-    ann: Announcement,
-    igc_ticket: iroh_blobs::ticket::BlobTicket,
-    meta_ticket: iroh_blobs::ticket::BlobTicket,
-}
-
-struct ValidatedArtifactAnnouncement {
-    ann: ArtifactAnnouncement,
-    tickets: Vec<iroh_blobs::ticket::BlobTicket>,
 }
 
 #[derive(Clone)]
@@ -115,11 +57,12 @@ impl IndexerHandle {
 /// Determines what the indexer stores after receiving an announcement.
 #[derive(Debug, Clone)]
 pub enum FetchPolicy {
-    /// Store only the metadata JSON blob; fetch the raw IGC on explicit request.
-    MetadataOnly,
-    /// Fetch and store every announced raw IGC blob.
+    /// Index announcements without fetching artifact bytes.
+    IndexOnly,
+    /// Fetch and store announced artifact bytes when public tickets are present.
     Eager,
-    /// Fetch only flights whose bbox overlaps this geographic region.
+    /// Fetch announced artifact bytes only when filter metadata is available
+    /// and overlaps this region.
     GeoFiltered {
         min_lat: f64,
         max_lat: f64,
@@ -207,61 +150,6 @@ impl Default for PublisherStats {
 type RateLimitState = Arc<Mutex<HashMap<NodeIdHex, PublisherStats>>>;
 
 const DEFAULT_MAX_CONCURRENT_ANNOUNCEMENTS: usize = 64;
-
-// ── Wire format ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct Announcement {
-    igc_hash: Blake3Hex,
-    meta_hash: Blake3Hex,
-    #[allow(dead_code)]
-    node_id: NodeIdHex,
-    igc_ticket: String,
-    meta_ticket: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ArtifactAnnouncement {
-    schema: String,
-    schema_version: u8,
-    record_id: Blake3Hex,
-    raw_igc_hash: Blake3Hex,
-    publication_mode: PublicationMode,
-    tickets: Vec<String>,
-    node_id: NodeIdHex,
-    protected_hash: Option<Blake3Hex>,
-    #[serde(default)]
-    companion_tickets: Vec<String>,
-    signature: String,
-    created_at: String,
-}
-
-#[derive(serde::Serialize)]
-struct ArtifactAnnouncementIdPayload<'a> {
-    schema: &'static str,
-    schema_version: u8,
-    raw_igc_hash: &'a Blake3Hex,
-    publication_mode: &'a PublicationMode,
-    tickets: &'a [String],
-    node_id: &'a NodeIdHex,
-    protected_hash: Option<&'a Blake3Hex>,
-    companion_tickets: &'a [String],
-    created_at: &'a str,
-}
-
-#[derive(serde::Serialize)]
-struct ArtifactAnnouncementSigningPayload<'a> {
-    schema: &'static str,
-    schema_version: u8,
-    record_id: &'a Blake3Hex,
-    raw_igc_hash: &'a Blake3Hex,
-    publication_mode: &'a PublicationMode,
-    tickets: &'a [String],
-    node_id: &'a NodeIdHex,
-    protected_hash: Option<&'a Blake3Hex>,
-    companion_tickets: &'a [String],
-    created_at: &'a str,
-}
 
 // ── run_indexer() ─────────────────────────────────────────────────────────────
 
@@ -356,211 +244,80 @@ async fn handle_announcement(
     rl_cfg: Option<&RateLimitConfig>,
     rl_state: Option<RateLimitState>,
 ) -> Result<AnnouncementDisposition, IndexerError> {
-    if let Err(e) = validate_payload_size(payload) {
-        return Ok(AnnouncementDisposition::Ignored(e.to_string()));
-    }
-
-    // ── 1. Parse JSON and dispatch legacy vs v0.3 announcements ─────────────
-    let value: serde_json::Value = match serde_json::from_slice(payload) {
-        Ok(value) => value,
-        Err(e) => {
-            return Ok(AnnouncementDisposition::Ignored(format!(
-                "malformed announcement: {e}"
-            )));
-        }
-    };
-
-    if value
-        .get("schema")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
-    {
-        let ann: ArtifactAnnouncement = match serde_json::from_value(value) {
-            Ok(ann) => ann,
-            Err(e) => {
-                return Ok(AnnouncementDisposition::Ignored(format!(
-                    "malformed artifact announcement: {e}"
-                )));
-            }
-        };
-        return handle_artifact_announcement(node, ann, policy, rl_cfg, rl_state).await;
-    }
-
-    let ann: Announcement = match serde_json::from_value(value) {
-        Ok(a) => a,
-        Err(e) => {
-            return Ok(AnnouncementDisposition::Ignored(format!(
-                "malformed announcement: {e}"
-            )));
-        }
-    };
-
-    // ── 2. Validate announcement invariants ───────────────────────────────────
-    let ann = match validate_announcement(ann) {
+    let ann = match ArtifactAnnouncement::parse_and_validate(payload) {
         Ok(ann) => ann,
         Err(e) => return Ok(AnnouncementDisposition::Ignored(e.to_string())),
     };
-
-    // ── 3. Rate limit ─────────────────────────────────────────────────────────
-    if let Some(reason) = apply_rate_limit(&ann.ann.node_id, rl_cfg, rl_state.as_ref()).await {
-        return Ok(AnnouncementDisposition::Ignored(reason));
-    }
-
-    // ── 4. Dedup ──────────────────────────────────────────────────────────────
-    if node
-        .store()
-        .has_index_record(&ann.ann.meta_hash, &ann.ann.node_id)?
-    {
-        tracing::trace!(igc_hash = %ann.ann.igc_hash, "already indexed — skipping");
-        return Ok(AnnouncementDisposition::Ignored(
-            "already indexed".to_string(),
-        ));
-    }
-
-    if node.store().has_meta_hash(&ann.ann.meta_hash)? {
-        record_remote_announcement(node, &ann.ann).await?;
-        tracing::debug!(igc_hash = %ann.ann.igc_hash, node_id = %ann.ann.node_id, "known metadata from new serving peer");
-        return Ok(AnnouncementDisposition::Indexed { fetched_igc: false });
-    }
-
-    tracing::debug!(igc_hash = %ann.ann.igc_hash, "new announcement received");
-
-    // ── 5. Fetch metadata blob ────────────────────────────────────────────────
-    let meta_bytes = fetch_blob(node, &ann.meta_ticket).await?;
-
-    // Verify hash
-    let actual_meta_hash = Blake3Hex::from_hash(blake3::hash(&meta_bytes));
-    if actual_meta_hash != ann.ann.meta_hash {
-        tracing::warn!(
-            expected = %ann.ann.meta_hash,
-            actual   = %actual_meta_hash,
-            "meta_hash mismatch — discarding"
-        );
-        return Ok(AnnouncementDisposition::Ignored(
-            AnnouncementError::MetaHashMismatch.to_string(),
-        ));
-    }
-
-    // ── 6. Validate metadata ──────────────────────────────────────────────────
-    let meta: FlightMetadata = match serde_json::from_slice(&meta_bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(AnnouncementDisposition::Ignored(
-                AnnouncementError::MetadataJson(e).to_string(),
-            ));
-        }
-    };
-    if let Err(e) = meta.validate() {
-        return Ok(AnnouncementDisposition::Ignored(e.to_string()));
-    }
-    if meta.igc_hash != ann.ann.igc_hash {
-        tracing::warn!(
-            expected = %ann.ann.igc_hash,
-            actual = %meta.igc_hash,
-            "metadata igc_hash mismatch — discarding"
-        );
-        return Ok(AnnouncementDisposition::Ignored(
-            AnnouncementError::MetadataIgcHashMismatch.to_string(),
-        ));
-    }
-
-    // ── 7. Store metadata blob ────────────────────────────────────────────────
-    node.store().put(&meta_bytes).await?;
-    // Track bytes accepted from this publisher for the MB/day rate limit.
-    record_bytes_accepted(&rl_state, &ann.ann.node_id, meta_bytes.len() as u64).await;
-
-    // ── 8. Apply fetch policy ─────────────────────────────────────────────────
-    let should_fetch_igc = match policy {
-        FetchPolicy::MetadataOnly => false,
-        FetchPolicy::Eager => true,
-        FetchPolicy::GeoFiltered {
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-        } => meta.bbox.as_ref().is_some_and(|bb| {
-            bb.max_lat >= *min_lat
-                && bb.min_lat <= *max_lat
-                && bb.max_lon >= *min_lon
-                && bb.min_lon <= *max_lon
-        }),
-    };
-
-    if should_fetch_igc {
-        let igc_bytes = fetch_blob(node, &ann.igc_ticket).await?;
-
-        let actual_igc_hash = Blake3Hex::from_hash(blake3::hash(&igc_bytes));
-        if actual_igc_hash != ann.ann.igc_hash {
-            tracing::warn!(
-                expected = %ann.ann.igc_hash,
-                actual   = %actual_igc_hash,
-                "igc_hash mismatch — discarding"
-            );
-            return Ok(AnnouncementDisposition::Ignored(
-                AnnouncementError::IgcHashMismatch.to_string(),
-            ));
-        }
-
-        node.store().put(&igc_bytes).await?;
-        record_bytes_accepted(&rl_state, &ann.ann.node_id, igc_bytes.len() as u64).await;
-        tracing::info!(igc_hash = %ann.ann.igc_hash, "fetched raw IGC blob");
-    }
-
-    // ── 9. Append source record ───────────────────────────────────────────────
-    record_remote_announcement(node, &ann.ann).await?;
-
-    tracing::info!(igc_hash = %ann.ann.igc_hash, "indexed flight");
-    Ok(AnnouncementDisposition::Indexed {
-        fetched_igc: should_fetch_igc,
-    })
+    handle_artifact_announcement(node, ann, policy, rl_cfg, rl_state).await
 }
 
 async fn handle_artifact_announcement(
     node: &IndexerHandle,
-    ann: ArtifactAnnouncement,
+    ann: crate::artifact_announcement::ValidatedArtifactAnnouncement,
     policy: &FetchPolicy,
     rl_cfg: Option<&RateLimitConfig>,
     rl_state: Option<RateLimitState>,
 ) -> Result<AnnouncementDisposition, IndexerError> {
-    let ann = match validate_artifact_announcement(ann) {
-        Ok(ann) => ann,
-        Err(e) => return Ok(AnnouncementDisposition::Ignored(e.to_string())),
-    };
-
     if let Some(reason) = apply_rate_limit(&ann.ann.node_id, rl_cfg, rl_state.as_ref()).await {
         return Ok(AnnouncementDisposition::Ignored(reason));
     }
 
     let mut fetched_public_artifact = false;
+    let mut authoritative_g_record_present = None;
     match ann.ann.publication_mode {
         PublicationMode::Public if should_fetch_v03_public_artifact(policy) => {
-            let bytes = fetch_blob(node, &ann.tickets[0]).await?;
-            let actual_hash = Blake3Hex::from_hash(blake3::hash(&bytes));
-            if actual_hash != ann.ann.raw_igc_hash {
+            let Some(bytes) = fetch_and_store_announced_artifact(
+                node,
+                &ann.tickets[0],
+                &ann.ann.raw_igc_hash,
+                &rl_state,
+                &ann.ann.node_id,
+            )
+            .await?
+            else {
                 return Ok(AnnouncementDisposition::Ignored(
-                    AnnouncementError::IgcHashMismatch.to_string(),
+                    "igc_hash mismatch".to_string(),
                 ));
+            };
+            let computed = g_record_present(&bytes);
+            if ann
+                .ann
+                .g_record_present
+                .is_some_and(|announced| announced != computed)
+            {
+                tracing::warn!(
+                    raw_igc_hash = %ann.ann.raw_igc_hash,
+                    announced = ann.ann.g_record_present,
+                    computed,
+                    "announcement g_record_present mismatch; local computation wins"
+                );
             }
-            node.store().put(&bytes).await?;
-            record_bytes_accepted(&rl_state, &ann.ann.node_id, bytes.len() as u64).await;
+            authoritative_g_record_present = Some(computed);
             fetched_public_artifact = true;
         }
         PublicationMode::Protected if should_fetch_v03_public_artifact(policy) => {
-            let bytes = fetch_blob(node, &ann.tickets[0]).await?;
-            let actual_hash = Blake3Hex::from_hash(blake3::hash(&bytes));
-            if Some(&actual_hash) != ann.ann.protected_hash.as_ref() {
+            let Some(_) = fetch_and_store_announced_artifact(
+                node,
+                &ann.tickets[0],
+                ann.ann
+                    .protected_hash
+                    .as_ref()
+                    .expect("protected hash was checked during validation"),
+                &rl_state,
+                &ann.ann.node_id,
+            )
+            .await?
+            else {
                 return Ok(AnnouncementDisposition::Ignored(
-                    AnnouncementError::IgcHashMismatch.to_string(),
+                    "igc_hash mismatch".to_string(),
                 ));
-            }
-            node.store().put(&bytes).await?;
-            record_bytes_accepted(&rl_state, &ann.ann.node_id, bytes.len() as u64).await;
+            };
             fetched_public_artifact = true;
         }
         PublicationMode::Private | PublicationMode::Public | PublicationMode::Protected => {}
     }
 
-    let record = ArtifactRegistryRecord {
+    let mut record = ArtifactRegistryRecord {
         raw_igc_hash: ann.ann.raw_igc_hash.clone(),
         pilot_id: None,
         publication_mode: ann.ann.publication_mode.clone(),
@@ -570,18 +327,35 @@ async fn handle_artifact_announcement(
             && fetched_public_artifact,
         has_protected_raw_companion: false,
         serving_node_ids: vec![ann.ann.node_id.clone()],
+        g_record_present: authoritative_g_record_present.or(ann.ann.g_record_present),
         recorded_at: canonical_utc_now(),
     };
 
-    if node
+    if let Some(existing) = node
         .store()
         .artifact_registry_record(&record.raw_igc_hash)?
-        .as_ref()
-        == Some(&record)
     {
-        return Ok(AnnouncementDisposition::Ignored(
-            "already indexed".to_string(),
-        ));
+        let same_serving_claim = existing.publication_mode == record.publication_mode
+            && existing.protected_hash == record.protected_hash
+            && existing.g_record_present == record.g_record_present
+            && existing.serving_node_ids.contains(&ann.ann.node_id);
+        if same_serving_claim {
+            return Ok(AnnouncementDisposition::Ignored(
+                "already indexed".to_string(),
+            ));
+        }
+        if existing.publication_mode == record.publication_mode
+            && existing.protected_hash == record.protected_hash
+            && existing.g_record_present == record.g_record_present
+        {
+            record.serving_node_ids = existing.serving_node_ids;
+            record.serving_node_ids.push(ann.ann.node_id.clone());
+            record.serving_node_ids.sort();
+            record.serving_node_ids.dedup();
+            record.has_raw_igc |= existing.has_raw_igc;
+            record.has_protected_sanitized_igc |= existing.has_protected_sanitized_igc;
+            record.has_protected_raw_companion |= existing.has_protected_raw_companion;
+        }
     }
 
     node.store()
@@ -595,6 +369,23 @@ async fn handle_artifact_announcement(
     Ok(AnnouncementDisposition::Indexed {
         fetched_igc: fetched_public_artifact,
     })
+}
+
+async fn fetch_and_store_announced_artifact(
+    node: &IndexerHandle,
+    ticket: &iroh_blobs::ticket::BlobTicket,
+    expected_hash: &Blake3Hex,
+    rl_state: &Option<RateLimitState>,
+    publisher_node_id: &NodeIdHex,
+) -> Result<Option<Vec<u8>>, IndexerError> {
+    let bytes = fetch_blob(node, ticket).await?;
+    let actual_hash = Blake3Hex::from_hash(blake3::hash(&bytes));
+    if actual_hash != *expected_hash {
+        return Ok(None);
+    }
+    node.store().put(&bytes).await?;
+    record_bytes_accepted(rl_state, publisher_node_id, bytes.len() as u64).await;
+    Ok(Some(bytes))
 }
 
 /// Accumulate bytes into the rate-limit state for a publisher.  No-op when
@@ -659,252 +450,6 @@ fn should_fetch_v03_public_artifact(policy: &FetchPolicy) -> bool {
     matches!(policy, FetchPolicy::Eager)
 }
 
-fn validate_payload_size(payload: &[u8]) -> Result<(), AnnouncementError> {
-    if payload.len() <= 1024 {
-        Ok(())
-    } else {
-        Err(AnnouncementError::TooLarge(payload.len()))
-    }
-}
-
-fn validate_announcement(ann: Announcement) -> Result<ValidatedAnnouncement, AnnouncementError> {
-    let igc_ticket: iroh_blobs::ticket::BlobTicket = ann
-        .igc_ticket
-        .parse::<iroh_blobs::ticket::BlobTicket>()
-        .map_err(|e| AnnouncementError::InvalidTicket {
-            ticket: "igc",
-            message: e.to_string(),
-        })?;
-    let meta_ticket: iroh_blobs::ticket::BlobTicket = ann
-        .meta_ticket
-        .parse::<iroh_blobs::ticket::BlobTicket>()
-        .map_err(|e| AnnouncementError::InvalidTicket {
-            ticket: "meta",
-            message: e.to_string(),
-        })?;
-
-    if Blake3Hex::from_bytes(igc_ticket.hash().as_bytes()) != ann.igc_hash {
-        return Err(AnnouncementError::TicketHashMismatch { ticket: "igc" });
-    }
-    if Blake3Hex::from_bytes(meta_ticket.hash().as_bytes()) != ann.meta_hash {
-        return Err(AnnouncementError::TicketHashMismatch { ticket: "meta" });
-    }
-    if NodeIdHex::from_public_key(igc_ticket.addr().id) != ann.node_id {
-        return Err(AnnouncementError::TicketNodeMismatch { ticket: "igc" });
-    }
-    if NodeIdHex::from_public_key(meta_ticket.addr().id) != ann.node_id {
-        return Err(AnnouncementError::TicketNodeMismatch { ticket: "meta" });
-    }
-
-    Ok(ValidatedAnnouncement {
-        ann,
-        igc_ticket,
-        meta_ticket,
-    })
-}
-
-fn validate_artifact_announcement(
-    ann: ArtifactAnnouncement,
-) -> Result<ValidatedArtifactAnnouncement, AnnouncementError> {
-    if ann.schema != ARTIFACT_ANNOUNCEMENT_SCHEMA {
-        return Err(AnnouncementError::UnsupportedSchema(ann.schema));
-    }
-    if ann.schema_version != ARTIFACT_ANNOUNCEMENT_VERSION {
-        return Err(AnnouncementError::UnsupportedVersion(ann.schema_version));
-    }
-    if ann.tickets.is_empty() {
-        return Err(AnnouncementError::MissingTickets);
-    }
-    match ann.publication_mode {
-        PublicationMode::Protected => {
-            if ann.protected_hash.is_none() {
-                return Err(AnnouncementError::ProtectedHashPresence);
-            }
-        }
-        PublicationMode::Public | PublicationMode::Private => {
-            if ann.protected_hash.is_some() {
-                return Err(AnnouncementError::ProtectedHashPresence);
-            }
-            if !ann.companion_tickets.is_empty() {
-                return Err(AnnouncementError::CompanionTicketPresence);
-            }
-        }
-    }
-
-    let expected_record_id = derive_artifact_announcement_record_id(
-        &ann.raw_igc_hash,
-        &ann.publication_mode,
-        &ann.tickets,
-        &ann.node_id,
-        ann.protected_hash.as_ref(),
-        &ann.companion_tickets,
-        &ann.created_at,
-    )?;
-    if ann.record_id != expected_record_id {
-        return Err(AnnouncementError::RecordIdMismatch);
-    }
-
-    let signature = decode_signature_hex(&ann.signature)?;
-    let signing_payload = artifact_announcement_signing_payload(
-        &ann.record_id,
-        &ann.raw_igc_hash,
-        &ann.publication_mode,
-        &ann.tickets,
-        &ann.node_id,
-        ann.protected_hash.as_ref(),
-        &ann.companion_tickets,
-        &ann.created_at,
-    )?;
-    node_id_public_key(&ann.node_id)?
-        .verify(&signing_payload, &signature)
-        .map_err(|_| AnnouncementError::SignatureVerification)?;
-
-    let tickets = ann
-        .tickets
-        .iter()
-        .map(|ticket| parse_artifact_ticket(ticket, "artifact"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let companion_tickets = ann
-        .companion_tickets
-        .iter()
-        .map(|ticket| parse_artifact_ticket(ticket, "companion"))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for ticket in &tickets {
-        let expected_hash = match ann.publication_mode {
-            PublicationMode::Public | PublicationMode::Private => &ann.raw_igc_hash,
-            PublicationMode::Protected => ann
-                .protected_hash
-                .as_ref()
-                .expect("protected hash was checked above"),
-        };
-        validate_ticket_identity(ticket, expected_hash, &ann.node_id, "artifact")?;
-    }
-    for ticket in &companion_tickets {
-        validate_ticket_identity(ticket, &ann.raw_igc_hash, &ann.node_id, "companion")?;
-    }
-
-    Ok(ValidatedArtifactAnnouncement { ann, tickets })
-}
-
-fn parse_artifact_ticket(
-    ticket: &str,
-    name: &'static str,
-) -> Result<iroh_blobs::ticket::BlobTicket, AnnouncementError> {
-    ticket
-        .parse::<iroh_blobs::ticket::BlobTicket>()
-        .map_err(|e| AnnouncementError::InvalidTicket {
-            ticket: name,
-            message: e.to_string(),
-        })
-}
-
-fn validate_ticket_identity(
-    ticket: &iroh_blobs::ticket::BlobTicket,
-    expected_hash: &Blake3Hex,
-    expected_node_id: &NodeIdHex,
-    name: &'static str,
-) -> Result<(), AnnouncementError> {
-    if Blake3Hex::from_bytes(ticket.hash().as_bytes()) != *expected_hash {
-        return Err(AnnouncementError::TicketHashMismatch { ticket: name });
-    }
-    if NodeIdHex::from_public_key(ticket.addr().id) != *expected_node_id {
-        return Err(AnnouncementError::TicketNodeMismatch { ticket: name });
-    }
-    Ok(())
-}
-
-fn derive_artifact_announcement_record_id(
-    raw_igc_hash: &Blake3Hex,
-    publication_mode: &PublicationMode,
-    tickets: &[String],
-    node_id: &NodeIdHex,
-    protected_hash: Option<&Blake3Hex>,
-    companion_tickets: &[String],
-    created_at: &str,
-) -> Result<Blake3Hex, AnnouncementError> {
-    let payload = ArtifactAnnouncementIdPayload {
-        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
-        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
-        raw_igc_hash,
-        publication_mode,
-        tickets,
-        node_id,
-        protected_hash,
-        companion_tickets,
-        created_at,
-    };
-    let bytes = json_canon::to_vec(&payload)?;
-    Ok(Blake3Hex::from_hash(blake3::hash(&bytes)))
-}
-
-fn artifact_announcement_signing_payload(
-    record_id: &Blake3Hex,
-    raw_igc_hash: &Blake3Hex,
-    publication_mode: &PublicationMode,
-    tickets: &[String],
-    node_id: &NodeIdHex,
-    protected_hash: Option<&Blake3Hex>,
-    companion_tickets: &[String],
-    created_at: &str,
-) -> Result<Vec<u8>, AnnouncementError> {
-    let payload = ArtifactAnnouncementSigningPayload {
-        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
-        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
-        record_id,
-        raw_igc_hash,
-        publication_mode,
-        tickets,
-        node_id,
-        protected_hash,
-        companion_tickets,
-        created_at,
-    };
-    Ok(json_canon::to_vec(&payload)?)
-}
-
-fn decode_signature_hex(value: &str) -> Result<iroh::Signature, AnnouncementError> {
-    if value.len() != 128
-        || !value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(AnnouncementError::SignatureEncoding);
-    }
-    let bytes = hex::decode(value).map_err(|_| AnnouncementError::SignatureEncoding)?;
-    let signature_bytes: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| AnnouncementError::SignatureEncoding)?;
-    Ok(iroh::Signature::from_bytes(&signature_bytes))
-}
-
-fn node_id_public_key(node_id: &NodeIdHex) -> Result<iroh::PublicKey, AnnouncementError> {
-    let bytes = hex::decode(node_id.as_str()).map_err(|_| AnnouncementError::SignatureEncoding)?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| AnnouncementError::SignatureEncoding)?;
-    iroh::PublicKey::from_bytes(&key_bytes).map_err(|_| AnnouncementError::SignatureEncoding)
-}
-
-async fn record_remote_announcement(
-    node: &IndexerHandle,
-    ann: &Announcement,
-) -> Result<(), crate::store::StoreError> {
-    let _was_appended = node
-        .store()
-        .append_index_if_absent(&IndexRecord {
-            source: IndexRecordSource::RemoteAnnouncement,
-            igc_hash: ann.igc_hash.clone(),
-            meta_hash: ann.meta_hash.clone(),
-            node_id: ann.node_id.clone(),
-            igc_ticket: ann.igc_ticket.clone(),
-            meta_ticket: ann.meta_ticket.clone(),
-            recorded_at: canonical_utc_now(),
-        })
-        .await?;
-    Ok(())
-}
-
 /// Download a blob from the network using a serialised `BlobTicket`.
 async fn fetch_blob(
     node: &IndexerHandle,
@@ -934,53 +479,7 @@ async fn fetch_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{Blake3Hex, NodeIdHex};
-
-    #[test]
-    fn validate_announcement_rejects_ticket_hash_mismatch() {
-        let ann = Announcement {
-            igc_hash: Blake3Hex::parse("a".repeat(64)).unwrap(),
-            meta_hash: Blake3Hex::parse("b".repeat(64)).unwrap(),
-            node_id: NodeIdHex::parse("c".repeat(64)).unwrap(),
-            igc_ticket: "blob_ticket_placeholder".to_string(),
-            meta_ticket: "blob_ticket_placeholder".to_string(),
-        };
-        assert!(validate_announcement(ann).is_err());
-    }
-
-    #[test]
-    fn deserialize_announcement_rejects_short_igc_hash() {
-        let json = format!(
-            r#"{{"igc_hash":"abc","meta_hash":"{}","node_id":"{}","igc_ticket":"","meta_ticket":""}}"#,
-            "b".repeat(64),
-            "c".repeat(64)
-        );
-        let result: Result<Announcement, _> = serde_json::from_str(&json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn deserialize_announcement_rejects_uppercase_meta_hash() {
-        let json = format!(
-            r#"{{"igc_hash":"{}","meta_hash":"{}","node_id":"{}","igc_ticket":"","meta_ticket":""}}"#,
-            "a".repeat(64),
-            "B".repeat(64),
-            "c".repeat(64)
-        );
-        let result: Result<Announcement, _> = serde_json::from_str(&json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn deserialize_announcement_rejects_short_node_id() {
-        let json = format!(
-            r#"{{"igc_hash":"{}","meta_hash":"{}","node_id":"too_short","igc_ticket":"","meta_ticket":""}}"#,
-            "a".repeat(64),
-            "b".repeat(64)
-        );
-        let result: Result<Announcement, _> = serde_json::from_str(&json);
-        assert!(result.is_err());
-    }
+    use crate::artifact_announcement::ArtifactAnnouncementError;
 
     #[test]
     fn rate_limit_config_default_values() {
@@ -992,24 +491,26 @@ mod tests {
 
     #[test]
     fn malformed_json_is_silently_ignored() {
-        // Verify that serde_json::from_slice fails gracefully for non-JSON.
-        let result: Result<Announcement, _> = serde_json::from_slice(b"not json at all");
-        assert!(result.is_err());
+        assert!(matches!(
+            ArtifactAnnouncement::parse_and_validate(b"not json at all"),
+            Err(ArtifactAnnouncementError::Json(_))
+        ));
     }
 
     #[test]
     fn announcement_missing_required_field_fails_parse() {
-        // JSON with igc_hash but missing meta_hash, node_id, tickets.
-        let json = r#"{"igc_hash":"aaaa"}"#;
-        let result: Result<Announcement, _> = serde_json::from_slice(json.as_bytes());
-        assert!(result.is_err());
+        let json = r#"{"schema":"igc-net/announcement"}"#;
+        assert!(matches!(
+            ArtifactAnnouncement::parse_and_validate(json.as_bytes()),
+            Err(ArtifactAnnouncementError::Json(_))
+        ));
     }
 
     #[test]
     fn oversized_announcement_is_rejected() {
         assert!(matches!(
-            validate_payload_size(&vec![0_u8; 1025]),
-            Err(AnnouncementError::TooLarge(1025))
+            ArtifactAnnouncement::parse_and_validate(&vec![0_u8; 1025]),
+            Err(ArtifactAnnouncementError::TooLarge(1025))
         ));
     }
 }

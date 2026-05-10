@@ -3,16 +3,14 @@
 //! See the igc-net protocol specification for the announcement wire format.
 
 use iroh_blobs::{BlobFormat, Hash};
-use serde::{Deserialize, Serialize};
 
+use crate::artifact_announcement::{ArtifactAnnouncement, ArtifactAnnouncementError};
 use crate::id::{Blake3Hex, NodeIdHex};
+use crate::igc::g_record_present;
 use crate::metadata::{FlightMetadata, MetadataError};
 use crate::node::{IgcIrohNode, NodeError};
 use crate::store::{IndexRecord, IndexRecordSource, PublicationMode};
 use crate::util::canonical_utc_now;
-
-const ARTIFACT_ANNOUNCEMENT_SCHEMA: &str = "igc-net/announcement";
-const ARTIFACT_ANNOUNCEMENT_VERSION: u8 = 1;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -22,16 +20,20 @@ pub enum PublishError {
     Node(#[from] NodeError),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
-    #[error("announcement too large: {0} bytes (max 1024)")]
-    AnnouncementTooLarge(usize),
-    #[error("JSON: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("announcement: {0}")]
+    Announcement(String),
     #[error("metadata: {0}")]
     Metadata(#[from] MetadataError),
     #[error("failed to add blob to iroh store: {0}")]
     BlobAdd(String),
     #[error("failed to broadcast announcement: {0}")]
     Broadcast(String),
+}
+
+impl From<ArtifactAnnouncementError> for PublishError {
+    fn from(error: ArtifactAnnouncementError) -> Self {
+        Self::Announcement(error.to_string())
+    }
 }
 
 // ── Result type ───────────────────────────────────────────────────────────────
@@ -47,6 +49,8 @@ pub struct PublishResult {
     pub igc_ticket: String,
     /// Serialised `BlobTicket` for the metadata blob.
     pub meta_ticket: String,
+    /// True when the raw IGC bytes contain at least one G-record line.
+    pub g_record_present: bool,
 }
 
 /// Result of publishing a protected flight.
@@ -60,6 +64,8 @@ pub struct ProtectedPublishResult {
     pub protected_ticket: String,
     /// Serialised `BlobTicket` for the raw companion artifact.
     pub raw_companion_ticket: String,
+    /// True when the raw IGC bytes contain at least one G-record line.
+    pub g_record_present: bool,
 }
 
 /// Result of publishing a private flight existence record.
@@ -69,62 +75,8 @@ pub struct PrivatePublishResult {
     pub raw_igc_hash: Blake3Hex,
     /// Serialised `BlobTicket` for the restricted raw IGC artifact.
     pub raw_igc_ticket: String,
-}
-
-// ── Announcement wire format ──────────────────────────────────────────────────
-
-/// JSON announcement sent over gossip (specs_igc.md §3.2).
-#[derive(Debug, Serialize, Deserialize)]
-struct Announcement {
-    igc_hash: Blake3Hex,
-    meta_hash: Blake3Hex,
-    node_id: NodeIdHex,
-    igc_ticket: String,
-    meta_ticket: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ArtifactAnnouncement {
-    schema: String,
-    schema_version: u8,
-    record_id: Blake3Hex,
-    raw_igc_hash: Blake3Hex,
-    publication_mode: PublicationMode,
-    tickets: Vec<String>,
-    node_id: NodeIdHex,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    protected_hash: Option<Blake3Hex>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    companion_tickets: Vec<String>,
-    signature: String,
-    created_at: String,
-}
-
-#[derive(Serialize)]
-struct ArtifactAnnouncementIdPayload<'a> {
-    schema: &'static str,
-    schema_version: u8,
-    raw_igc_hash: &'a Blake3Hex,
-    publication_mode: &'a PublicationMode,
-    tickets: &'a [String],
-    node_id: &'a NodeIdHex,
-    protected_hash: Option<&'a Blake3Hex>,
-    companion_tickets: &'a [String],
-    created_at: &'a str,
-}
-
-#[derive(Serialize)]
-struct ArtifactAnnouncementSigningPayload<'a> {
-    schema: &'static str,
-    schema_version: u8,
-    record_id: &'a Blake3Hex,
-    raw_igc_hash: &'a Blake3Hex,
-    publication_mode: &'a PublicationMode,
-    tickets: &'a [String],
-    node_id: &'a NodeIdHex,
-    protected_hash: Option<&'a Blake3Hex>,
-    companion_tickets: &'a [String],
-    created_at: &'a str,
+    /// True when the raw IGC bytes contain at least one G-record line.
+    pub g_record_present: bool,
 }
 
 // ── publish() ─────────────────────────────────────────────────────────────────
@@ -133,25 +85,20 @@ struct ArtifactAnnouncementSigningPayload<'a> {
 ///
 /// # Steps
 /// 1. BLAKE3(igc_bytes) → `igc_hash`
-/// 2. Reuse the latest locally-published metadata blob for this `igc_hash` if present
-/// 3. Otherwise: `FlightMetadata::from_igc_bytes()` → metadata struct
-/// 4. `metadata.to_blob_bytes()` → `meta_bytes`; BLAKE3(meta_bytes) → `meta_hash`
-/// 5. `FlatFileStore::put()` both blobs
-/// 6. Add both blobs to iroh-blobs → generate `BlobTicket`s
-/// 7. Build and size-check the announcement JSON
-/// 8. Broadcast on gossip `TOPIC_ID`
-/// 9. `FlatFileStore::append_index()`
+/// 2. Derive `g_record_present`
+/// 3. Reuse or build the local metadata blob
+/// 4. Store blobs locally and in iroh-blobs
+/// 5. Broadcast a public artifact announcement
+/// 6. Update local store records
 pub async fn publish(
     node: &IgcIrohNode,
     igc_bytes: Vec<u8>,
     original_filename: Option<&str>,
 ) -> Result<PublishResult, PublishError> {
-    // ── 1. Compute igc_hash ───────────────────────────────────────────────────
-    let igc_hash_blake3 = blake3::hash(&igc_bytes);
-    let igc_hash_bytes = *igc_hash_blake3.as_bytes();
-    let igc_hash = Blake3Hex::from_hash(igc_hash_blake3);
+    // ── 1-2. Compute content hash and signature-presence flag ────────────────
+    let (igc_hash, igc_hash_bytes, g_record_present) = raw_igc_identity(&igc_bytes);
 
-    // ── 2-4. Reuse existing local metadata when possible ─────────────────────
+    // ── 3. Reuse existing local metadata when possible ───────────────────────
     let (meta_hash, meta_bytes) = match node
         .store()
         .latest_local_publish(&igc_hash, node.node_id())?
@@ -178,35 +125,30 @@ pub async fn publish(
     let meta_hash_blake3 = blake3::hash(&meta_bytes);
     let meta_hash_bytes = *meta_hash_blake3.as_bytes();
 
-    // ── 5. Store in FlatFileStore ─────────────────────────────────────────────
+    // ── 4. Store locally and register with iroh-blobs ────────────────────────
     node.store().put(&igc_bytes).await?;
     node.store().put(&meta_bytes).await?;
 
-    // ── 6. Register with iroh-blobs and create tickets ────────────────────────
     let igc_ticket = import_and_ticket(node, igc_bytes.clone(), igc_hash_bytes).await?;
     let meta_ticket = import_and_ticket(node, meta_bytes.clone(), meta_hash_bytes).await?;
 
-    // ── 7. Build announcement JSON (≤ 1024 bytes) ─────────────────────────────
-    let announcement = Announcement {
-        igc_hash: igc_hash.clone(),
-        meta_hash: meta_hash.clone(),
-        node_id: node.node_id().clone(),
-        igc_ticket: igc_ticket.clone(),
-        meta_ticket: meta_ticket.clone(),
-    };
-    let announcement_bytes = build_announcement(&announcement)?;
-
-    // ── 8. Broadcast on gossip ────────────────────────────────────────────────
-    // Reuse the node's persistent announce-topic sender rather than creating
-    // a new subscription per publish call.
-    node.announce_sender()
-        .broadcast(announcement_bytes.into())
-        .await
-        .map_err(|e| PublishError::Broadcast(e.to_string()))?;
+    // ── 5. Build and broadcast artifact announcement ─────────────────────────
+    let announcement = ArtifactAnnouncement::signed(
+        &node.node_secret_key(),
+        igc_hash.clone(),
+        PublicationMode::Public,
+        vec![igc_ticket.clone()],
+        node.node_id().clone(),
+        None,
+        Vec::new(),
+        Some(g_record_present),
+        canonical_utc_now(),
+    )?;
+    broadcast_artifact_announcement(node, &announcement).await?;
 
     tracing::info!(%igc_hash, %meta_hash, "published flight");
 
-    // ── 9. Append to index ────────────────────────────────────────────────────
+    // ── 6. Update local store records ────────────────────────────────────────
     let recorded_at = canonical_utc_now();
     node.store()
         .append_index_if_absent(&IndexRecord {
@@ -225,24 +167,19 @@ pub async fn publish(
         meta_hash,
         igc_ticket,
         meta_ticket,
+        g_record_present,
     })
 }
 
 /// Publish a protected flight to local blob storage and iroh-blobs.
 ///
-/// This deliberately does not use the legacy public announcement format:
-/// legacy announcements identify `igc_ticket` by `raw_igc_hash`, which would
-/// announce the raw companion as a public artifact. It broadcasts the v0.3
-/// mode-aware announcement where `tickets` point to the sanitized artifact.
-/// Raw companion tickets are returned to the local gRPC caller; they are omitted
-/// from gossip until the announcement size budget is revised.
+/// The public announcement points to the sanitized artifact. Raw companion
+/// tickets are returned to the local gRPC caller and omitted from gossip.
 pub async fn publish_protected(
     node: &IgcIrohNode,
     igc_bytes: Vec<u8>,
 ) -> Result<ProtectedPublishResult, PublishError> {
-    let raw_igc_hash_blake3 = blake3::hash(&igc_bytes);
-    let raw_igc_hash_bytes = *raw_igc_hash_blake3.as_bytes();
-    let raw_igc_hash = Blake3Hex::from_hash(raw_igc_hash_blake3);
+    let (raw_igc_hash, raw_igc_hash_bytes, g_record_present) = raw_igc_identity(&igc_bytes);
 
     let sanitized_igc_bytes = sanitize_protected_igc(&igc_bytes);
     let protected_hash_blake3 = blake3::hash(&sanitized_igc_bytes);
@@ -256,7 +193,7 @@ pub async fn publish_protected(
         import_and_ticket(node, sanitized_igc_bytes, protected_hash_bytes).await?;
     let raw_companion_ticket = import_and_ticket(node, igc_bytes, raw_igc_hash_bytes).await?;
 
-    let announcement = build_artifact_announcement(
+    let announcement = ArtifactAnnouncement::signed(
         &node.node_secret_key(),
         raw_igc_hash.clone(),
         PublicationMode::Protected,
@@ -264,13 +201,10 @@ pub async fn publish_protected(
         node.node_id().clone(),
         Some(protected_hash.clone()),
         Vec::new(),
+        Some(g_record_present),
         canonical_utc_now(),
     )?;
-    let announcement_bytes = build_artifact_announcement_bytes(&announcement)?;
-    node.announce_sender()
-        .broadcast(announcement_bytes.into())
-        .await
-        .map_err(|e| PublishError::Broadcast(e.to_string()))?;
+    broadcast_artifact_announcement(node, &announcement).await?;
 
     tracing::info!(%raw_igc_hash, %protected_hash, "published protected flight");
 
@@ -279,23 +213,22 @@ pub async fn publish_protected(
         protected_hash,
         protected_ticket,
         raw_companion_ticket,
+        g_record_present,
     })
 }
 
 /// Publish a private flight to local blob storage and announce its restricted
-/// raw artifact locator with the v0.3 mode-aware announcement shape.
+/// raw artifact locator.
 pub async fn publish_private(
     node: &IgcIrohNode,
     igc_bytes: Vec<u8>,
 ) -> Result<PrivatePublishResult, PublishError> {
-    let raw_igc_hash_blake3 = blake3::hash(&igc_bytes);
-    let raw_igc_hash_bytes = *raw_igc_hash_blake3.as_bytes();
-    let raw_igc_hash = Blake3Hex::from_hash(raw_igc_hash_blake3);
+    let (raw_igc_hash, raw_igc_hash_bytes, g_record_present) = raw_igc_identity(&igc_bytes);
 
     node.store().put(&igc_bytes).await?;
     let raw_igc_ticket = import_and_ticket(node, igc_bytes, raw_igc_hash_bytes).await?;
 
-    let announcement = build_artifact_announcement(
+    let announcement = ArtifactAnnouncement::signed(
         &node.node_secret_key(),
         raw_igc_hash.clone(),
         PublicationMode::Private,
@@ -303,23 +236,30 @@ pub async fn publish_private(
         node.node_id().clone(),
         None,
         Vec::new(),
+        Some(g_record_present),
         canonical_utc_now(),
     )?;
-    let announcement_bytes = build_artifact_announcement_bytes(&announcement)?;
-    node.announce_sender()
-        .broadcast(announcement_bytes.into())
-        .await
-        .map_err(|e| PublishError::Broadcast(e.to_string()))?;
+    broadcast_artifact_announcement(node, &announcement).await?;
 
     tracing::info!(%raw_igc_hash, "published private flight");
 
     Ok(PrivatePublishResult {
         raw_igc_hash,
         raw_igc_ticket,
+        g_record_present,
     })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn raw_igc_identity(igc_bytes: &[u8]) -> (Blake3Hex, [u8; 32], bool) {
+    let hash = blake3::hash(igc_bytes);
+    (
+        Blake3Hex::from_hash(hash),
+        *hash.as_bytes(),
+        g_record_present(igc_bytes),
+    )
+}
 
 /// Import bytes into iroh-blobs so they can be served to peers.
 /// Returns a `BlobTicket` string.
@@ -349,116 +289,15 @@ async fn make_ticket(node: &IgcIrohNode, hash_bytes: [u8; 32]) -> Result<String,
     Ok(ticket.to_string())
 }
 
-/// Serialise and size-check the announcement.
-fn build_announcement(ann: &Announcement) -> Result<Vec<u8>, PublishError> {
-    let json = serde_json::to_vec(ann)?;
-    if json.len() > 1024 {
-        return Err(PublishError::AnnouncementTooLarge(json.len()));
-    }
-    Ok(json)
-}
-
-fn build_artifact_announcement(
-    node_secret_key: &iroh::SecretKey,
-    raw_igc_hash: Blake3Hex,
-    publication_mode: PublicationMode,
-    tickets: Vec<String>,
-    node_id: NodeIdHex,
-    protected_hash: Option<Blake3Hex>,
-    companion_tickets: Vec<String>,
-    created_at: String,
-) -> Result<ArtifactAnnouncement, PublishError> {
-    let record_id = derive_artifact_announcement_record_id(
-        &raw_igc_hash,
-        &publication_mode,
-        &tickets,
-        &node_id,
-        protected_hash.as_ref(),
-        &companion_tickets,
-        &created_at,
-    )?;
-    let signing_bytes = artifact_announcement_signing_payload(
-        &record_id,
-        &raw_igc_hash,
-        &publication_mode,
-        &tickets,
-        &node_id,
-        protected_hash.as_ref(),
-        &companion_tickets,
-        &created_at,
-    )?;
-    let signature = hex::encode(node_secret_key.sign(&signing_bytes).to_bytes());
-
-    Ok(ArtifactAnnouncement {
-        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA.to_string(),
-        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
-        record_id,
-        raw_igc_hash,
-        publication_mode,
-        tickets,
-        node_id,
-        protected_hash,
-        companion_tickets,
-        signature,
-        created_at,
-    })
-}
-
-fn build_artifact_announcement_bytes(ann: &ArtifactAnnouncement) -> Result<Vec<u8>, PublishError> {
-    let json = serde_json::to_vec(ann)?;
-    if json.len() > 1024 {
-        return Err(PublishError::AnnouncementTooLarge(json.len()));
-    }
-    Ok(json)
-}
-
-fn derive_artifact_announcement_record_id(
-    raw_igc_hash: &Blake3Hex,
-    publication_mode: &PublicationMode,
-    tickets: &[String],
-    node_id: &NodeIdHex,
-    protected_hash: Option<&Blake3Hex>,
-    companion_tickets: &[String],
-    created_at: &str,
-) -> Result<Blake3Hex, PublishError> {
-    let payload = ArtifactAnnouncementIdPayload {
-        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
-        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
-        raw_igc_hash,
-        publication_mode,
-        tickets,
-        node_id,
-        protected_hash,
-        companion_tickets,
-        created_at,
-    };
-    let bytes = json_canon::to_vec(&payload)?;
-    Ok(Blake3Hex::from_hash(blake3::hash(&bytes)))
-}
-
-fn artifact_announcement_signing_payload(
-    record_id: &Blake3Hex,
-    raw_igc_hash: &Blake3Hex,
-    publication_mode: &PublicationMode,
-    tickets: &[String],
-    node_id: &NodeIdHex,
-    protected_hash: Option<&Blake3Hex>,
-    companion_tickets: &[String],
-    created_at: &str,
-) -> Result<Vec<u8>, PublishError> {
-    let payload = ArtifactAnnouncementSigningPayload {
-        schema: ARTIFACT_ANNOUNCEMENT_SCHEMA,
-        schema_version: ARTIFACT_ANNOUNCEMENT_VERSION,
-        record_id,
-        raw_igc_hash,
-        publication_mode,
-        tickets,
-        node_id,
-        protected_hash,
-        companion_tickets,
-        created_at,
-    };
-    Ok(json_canon::to_vec(&payload)?)
+async fn broadcast_artifact_announcement(
+    node: &IgcIrohNode,
+    ann: &ArtifactAnnouncement,
+) -> Result<(), PublishError> {
+    let announcement_bytes = ann.to_gossip_bytes()?;
+    node.announce_sender()
+        .broadcast(announcement_bytes.into())
+        .await
+        .map_err(|e| PublishError::Broadcast(e.to_string()))
 }
 
 /// Find the `meta_hash` for a known `igc_hash` from the local index.
@@ -535,21 +374,8 @@ fn protected_rewrite_prefix(line_body: &[u8]) -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_announcement::signing_payload;
     use crate::id::{Blake3Hex, NodeIdHex};
-
-    #[test]
-    fn announcement_json_is_valid_and_small() {
-        let ann = Announcement {
-            igc_hash: Blake3Hex::parse("a".repeat(64)).unwrap(),
-            meta_hash: Blake3Hex::parse("b".repeat(64)).unwrap(),
-            node_id: NodeIdHex::parse("c".repeat(64)).unwrap(),
-            igc_ticket: "igc_ticket_placeholder_string".to_string(),
-            meta_ticket: "meta_ticket_placeholder_string".to_string(),
-        };
-        let bytes = build_announcement(&ann).unwrap();
-        assert!(bytes.len() <= 1024, "announcement must be ≤ 1024 bytes");
-        let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    }
 
     #[test]
     fn build_metadata_blob_produces_canonical_metadata() {
@@ -596,7 +422,7 @@ mod tests {
         let protected_hash = Blake3Hex::parse("b".repeat(64)).unwrap();
         let node_id = NodeIdHex::from_public_key(node_key.public());
 
-        let announcement = build_artifact_announcement(
+        let announcement = ArtifactAnnouncement::signed(
             &node_key,
             raw_igc_hash.clone(),
             PublicationMode::Protected,
@@ -604,6 +430,7 @@ mod tests {
             node_id.clone(),
             Some(protected_hash.clone()),
             vec!["raw-companion-ticket".to_string()],
+            Some(true),
             "2026-05-01T09:14:00Z".to_string(),
         )
         .unwrap();
@@ -615,13 +442,13 @@ mod tests {
         assert_eq!(announcement.protected_hash, Some(protected_hash));
         assert_eq!(announcement.companion_tickets, vec!["raw-companion-ticket"]);
 
-        let bytes = build_artifact_announcement_bytes(&announcement).unwrap();
+        let bytes = announcement.to_gossip_bytes().unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(value.get("igc_ticket").is_none());
         assert!(value.get("meta_ticket").is_none());
         assert!(value.get("raw_igc_hash").is_some());
 
-        let signing_bytes = artifact_announcement_signing_payload(
+        let signing_bytes = signing_payload(
             &announcement.record_id,
             &announcement.raw_igc_hash,
             &announcement.publication_mode,
@@ -629,6 +456,7 @@ mod tests {
             &announcement.node_id,
             announcement.protected_hash.as_ref(),
             &announcement.companion_tickets,
+            announcement.g_record_present,
             &announcement.created_at,
         )
         .unwrap();
